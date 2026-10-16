@@ -1,0 +1,47 @@
+{
+  "now": "2026-10-08T15:00:00Z",
+  "candidate": {
+    "firstName": "Priya",
+    "fullName": "Priya Ramos",
+    "email": "priya.ramos@example.com",
+    "location": "Raleigh, NC",
+    "zone": "Eastern Time (US & Canada)",
+    "threadId": "19a0f1c2d3e4f5a6",
+    "threadSubject": "Field Engineer, AI Labs at Turing: next steps",
+    "lastMessageId": "<CAPRIYA0001.fixture@mail.gmail.com>"
+  },
+  "interviewer": {
+    "firstName": "Dana",
+    "fullName": "Dana Okafor",
+    "email": "dana.okafor@turing.com",
+    "title": "Hiring Manager, AI Labs",
+    "zone": "America/Los_Angeles"
+  },
+  "spec": {
+    "applicationId": "900000000001",
+    "jobInterviewId": "900000000002",
+    "candidateId": "900000000003",
+    "jobName": "Field Engineer, AI Labs",
+    "kitId": "900000000004",
+    "durationMin": 30,
+    "attempt": 1
+  },
+  "recruiter": {
+    "firstName": "Sam",
+    "fullName": "Sam Vangelos",
+    "title": "Senior Recruiter",
+    "email": "sam.vangelos@turing.com"
+  },
+  "candidateWindows": [
+    { "start": "2026-10-09T13:00:00-04:00", "end": "2026-10-09T17:00:00-04:00" },
+    { "start": "2026-10-12T14:00:00-04:00", "end": "2026-10-12T16:00:00-04:00" }
+  ],
+  "freeBusyRange": { "start": "2026-10-08T15:00:00Z", "end": "2026-10-15T15:00:00Z" },
+  "freeBusy": {
+    "primary": { "busy": [{ "start": "2026-10-09T18:00:00Z", "end": "2026-10-09T20:00:00Z" }] },
+    "dana.okafor@turing.com": { "busy": [{ "start": "2026-10-09T16:00:00Z", "end": "2026-10-09T18:00:00Z" }] }
+  },
+  "disclosureLine": "Scheduling for this interview is handled with Turing's AI assistant on Sam's behalf; reply here and Sam reads it directly.",
+  "candidateSummary": "Priya leads field deployments for an inference platform and has shipped on-site integrations for three enterprise customers. Strong on debugging under customer pressure; wants more hands-on model work.",
+  "otherCandidateNames": ["Jordan Mbeki"]
+}

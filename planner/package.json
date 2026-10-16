@@ -1,0 +1,22 @@
+{
+  "name": "@recruiting-agents/scheduling",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "CLO-430: the interview-scheduling resident's pure planner. Turns a JSON input into the exact Calendar and Gmail payloads WORKFLOW.md describes; dispatches nothing.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "plan": "tsx src/cli.ts plan",
+    "render": "tsx src/cli.ts render"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.0"
+  }
+}
