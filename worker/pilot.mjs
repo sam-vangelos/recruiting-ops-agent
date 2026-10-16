@@ -7,6 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ALLOWED, JOB_ID, permitted } from './gate.mjs';
+import { isActionDischarged, summarizeLedger } from './ledger.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVICES = ['gmail', 'calendar', 'slack', 'greenhouse'];
@@ -429,7 +430,8 @@ export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, cl
     const now = Date.now();
     const scanSince = previous ? Date.parse(previous.scanned_at) - 2 * 60 * MINUTE : now - 7 * 24 * 60 * MINUTE;
     const day = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(scanSince)).map(p => [p.type, p.value]));
-    const context = { allowed_tools: ALLOWED, now: iso(now), timezone: 'America/Los_Angeles', scan_since: iso(scanSince), scan_since_date_pacific: `${day.year}/${day.month}/${day.day}`, upcoming_until: iso(now + 14 * 24 * 60 * MINUTE), previous_episodes: (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed') };
+    const ledger = summarizeLedger(dataDir);
+    const context = { allowed_tools: ALLOWED, now: iso(now), timezone: 'America/Los_Angeles', scan_since: iso(scanSince), scan_since_date_pacific: `${day.year}/${day.month}/${day.day}`, upcoming_until: iso(now + 14 * 24 * 60 * MINUTE), previous_episodes: (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed'), ledger };
     const prompt = fs.readFileSync(path.join(HERE, 'prompt.md'), 'utf8') + '\n\n<scan_context>\n' + JSON.stringify(context) + '\n</scan_context>';
     streamFd = fs.openSync(path.join(dataDir, 'latest-stream.jsonl'), 'w', 0o600);
     stderrFd = fs.openSync(path.join(dataDir, 'latest-stderr.txt'), 'w', 0o600);
@@ -466,6 +468,11 @@ export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, cl
     const missing = (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed' && !report.episodes?.some(x => x.episode_id === ep.episode_id));
     if (missing.length) { verification.ok = false; verification.errors.push('Previously open episodes were omitted; last good checkpoint retained.'); }
     report = verification.report;
+    if (verification.ok) {
+      for (const ep of report.episodes ?? []) {
+        ep.next_actions = (ep.next_actions ?? []).filter(a => !isActionDischarged(ledger, ep.episode_id, a.action_key));
+      }
+    }
     atomic(path.join(dataDir, 'last-verification.json'), verification);
     verificationWritten = true;
     if (!verification.ok) throw new Error('Read verification failed: ' + verification.errors.join(' '));

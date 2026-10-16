@@ -33,6 +33,7 @@ All runtime files are private (`0600` inside a `0700` directory), outside Git:
 - `latest-stream.jsonl`, `latest-stderr.txt`: the latest private diagnostic output. These may contain candidate information. Do not commit or share them.
 - `last-good-stream.jsonl`: supporting stream for the last verified scan, retained when subsequent scans fail.
 - `runs/`: per-run copies of the stream and, when the run reached verification, its verification, named by run start time (`<started_at>-stream.jsonl`, `<started_at>-verification.json`), pruned to the newest 10 runs. These carry the same candidate information as the latest files.
+- `ledger.jsonl`: shared append-only ledger written by the interactive session (`ledger.mjs append`) and read by `pilot.mjs` at the start of each scan (`summarizeLedger`). Discharged or declined `action_key`s are passed in `<scan_context>` and filtered from `checkpoint.json` and `DRAFTS.md`. See `../LEDGER.md`.
 - `settings.json`: generated exact read permissions and hook settings, with user plugins disabled for the invocation. No credentials are copied.
 
 Claude Code persists oversized tool results outside this directory, under `~/.claude/projects/<data directory with / and . replaced by ->/<session>/tool-results/`. After every run, success or failure, the worker deletes the regular files under those `tool-results` directories and then any directories the deletion left empty; it touches nothing else there.
@@ -55,7 +56,7 @@ A stale `HEALTH.md` checked time means the health job itself may have stopped. T
 
 ## Shadow testing
 
-`shadow.mjs` runs the same read-only scan with a second model and scores each of its runs against the live pilot, so the two models can be compared on the same scheduling traffic. It sits beside `pilot.mjs`, `gate.mjs` and `prompt.md` in the installed app directory and runs that same frozen copy. The first shadow model is `claude-haiku-5-5`.
+`shadow.mjs` runs the same read-only scan with a second model and scores each of its runs against the live pilot, so the two models can be compared on the same scheduling traffic. It sits beside `pilot.mjs`, `gate.mjs`, `ledger.mjs` and `prompt.md` in the installed app directory and runs that same frozen copy. The first shadow model is `claude-haiku-5-5`.
 
 ```sh
 node shadow.mjs cycle --model claude-haiku-5-5 --shadow-dir /abs/shadow --live-dir /abs/live --claude /abs/claude
@@ -78,7 +79,7 @@ The shadow must have its own `--shadow-dir`, separate from the live data directo
 ## Verification
 
 ```sh
-node --test agents/scheduling-pilot/pilot.test.mjs agents/scheduling-pilot/shadow.test.mjs
+node --test worker/pilot.test.mjs worker/shadow.test.mjs worker/ledger.test.mjs
 ```
 
-Tests use only fictional provider results and a fake Claude executable. They exercise actual run/checkpoint files, allowed/denied hooks, false-success rejection, all-source evidence, nested MCP errors, live empty envelopes, warnings for uncited reads, partial scans, full Gmail content, pagination, preserved pending work, repeated proposals, private permissions, run history, persisted tool-result cleanup, overlap prevention, stale-lock reclaim, blocked runs, the blocking hook mode, stale health, and alert recovery. The shadow tests pair fictional run directories and run `cycle` against the same kind of fake executable. No live reads, sends, notifications, or schedule installation occur in tests. Successful live scheduled runs and an OS notification witness must be checked separately during activation.
+Tests use only fictional provider results and a fake Claude executable. They exercise actual run/checkpoint files, allowed/denied hooks, false-success rejection, all-source evidence, nested MCP errors, live empty envelopes, warnings for uncited reads, partial scans, full Gmail content, pagination, preserved pending work, repeated proposals, private permissions, run history, persisted tool-result cleanup, overlap prevention, stale-lock reclaim, blocked runs, the blocking hook mode, stale health, alert recovery, ledger append/read/dedupe, rule-rendering freshness, and discharged-action filtering. The shadow tests pair fictional run directories and run `cycle` against the same kind of fake executable. No live reads, sends, notifications, or schedule installation occur in tests. Successful live scheduled runs and an OS notification witness must be checked separately during activation.
