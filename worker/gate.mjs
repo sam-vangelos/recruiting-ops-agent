@@ -15,14 +15,21 @@ export const ALLOWED = [
   'mcp__claude_ai_Google_Calendar__get_event',
   'mcp__claude_ai_Slack__slack_search_public_and_private',
   'mcp__greenhouse-recruiter__get_my_job',
+  'mcp__greenhouse-recruiter__search_my_applications',
+  'mcp__greenhouse-recruiter__search_my_candidates',
   'mcp__greenhouse-recruiter__search_my_interviews',
 ];
 
 export function permitted(name, input = {}) {
   if (!ALLOWED.includes(name)) return false;
   if (name.endsWith('__get_my_job')) return String(input.id) === JOB_ID;
-  if (name.endsWith('__search_my_interviews')) {
+  if (name.endsWith('__search_my_interviews') || name.endsWith('__search_my_applications')) {
     const ids = Array.isArray(input.job_ids) ? input.job_ids : String(input.job_ids ?? '').split(',');
+    return ids.length === 1 && String(ids[0]) === JOB_ID;
+  }
+  if (name.endsWith('__search_my_candidates') && (input.job_ids !== undefined || input.job_id !== undefined)) {
+    const raw = input.job_ids ?? [input.job_id];
+    const ids = Array.isArray(raw) ? raw : String(raw).split(',');
     return ids.length === 1 && String(ids[0]) === JOB_ID;
   }
   return true;

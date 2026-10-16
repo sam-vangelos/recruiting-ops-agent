@@ -15,7 +15,7 @@ Nothing the interactive session does is invisible to the next ambient scan, and 
 - [`LEDGER.md`](LEDGER.md) — Schema and idempotency contract for `~/.recruiting-agents/scheduling-pilot/ledger.jsonl`.
 - [`CLAUDE.md`](CLAUDE.md) — Interactive Claude Code session harness (operating section generated from `JOB.md`).
 - [`tools/render.mjs`](tools/render.mjs) — Renders both [`worker/prompt.md`](worker/prompt.md) and the operating section of [`CLAUDE.md`](CLAUDE.md) from [`JOB.md`](JOB.md).
-- [`worker/`](worker/) — Ambient read-only runner (`pilot.mjs`), `PreToolUse` gate (`gate.mjs`), shared ledger module (`ledger.mjs`), second-model shadow runner (`shadow.mjs`), generated prompt (`prompt.md`), and test suite (`*.test.mjs`).
+- [`worker/`](worker/) — Ambient read-only runner (`pilot.mjs`), `PreToolUse` gate (`gate.mjs`), Greenhouse + Calendar roster builder (`roster.mjs`), shared ledger module (`ledger.mjs`), second-model shadow runner (`shadow.mjs`), generated prompt (`prompt.md`), and test suite (`*.test.mjs`).
 - [`planner/`](planner/) — Pure TypeScript slot/payload planner moved from `recruiting-agents/agents/scheduling` (being rebuilt to match `JOB.md`; where they disagree, `JOB.md` wins).
 - [`launchd/`](launchd/) — LaunchAgent templates for `.worker` (every 30m), `.health` (every 5m), and `.shadow-haiku` (8x/day through 2026-10-23, `CLO-550`).
 
@@ -55,13 +55,13 @@ The three `launchd` jobs (`com.recruiting-agents.scheduling-pilot.worker`, `.hea
 To cut over the installed worker after the gate is green and Sam approves:
 
 ```sh
-cp worker/pilot.mjs worker/gate.mjs worker/shadow.mjs worker/ledger.mjs worker/prompt.md ~/.recruiting-agents/scheduling-pilot/app/
+cp worker/pilot.mjs worker/gate.mjs worker/shadow.mjs worker/ledger.mjs worker/roster.mjs worker/prompt.md ~/.recruiting-agents/scheduling-pilot/app/
 launchctl kickstart gui/$(id -u)/com.recruiting-agents.scheduling-pilot.worker
 node ~/.recruiting-agents/scheduling-pilot/app/pilot.mjs status
 ```
 
 ## Design decisions logged on CLO-555
 
-- **Harness boot ordering**: On session start, `CLAUDE.md` surfaces candidates in play ordered with overdue/upcoming wait timers first (12h interviewer chase, 24h candidate nudge), followed by unreviewed worker proposals from `DRAFTS.md`, before taking instructions.
+- **Harness boot ordering (day view first)**: On session start, `CLAUDE.md` builds the Greenhouse + Google Calendar roster (`worker/roster.mjs`), presents today's candidate events in chronological order with interviewer acceptance and candidate confirmation state (with Sam's own Calendly screens shown as roster facts; open question on `CLO-555` whether the agent owns that step), followed by all candidates in play with their `JOB.md` step, roster discrepancies, and unreviewed worker proposals from `DRAFTS.md`.
 - **Two-phase action persistence in `ledger.jsonl`**: Outward session steps append an `action` record with `status: "intent"` and `idempotency_key` before dispatch, then append `status: "dispatched"` with `provider_id` on completion; `dedupe()` folds by `idempotency_key` (latest record wins) so interrupted sends remain visible on restart while completed ones carry their provider ID.
 - **Defense-in-depth proposal suppression**: The worker both injects the deduped ledger state into `<scan_context>` on `claude` stdin and deterministically filters out any `next_actions` whose `action_key` is already discharged by an `action` record or declined by an `approval` record before writing `checkpoint.json` and `DRAFTS.md`.

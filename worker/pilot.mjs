@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ALLOWED, JOB_ID, permitted } from './gate.mjs';
 import { isActionDischarged, summarizeLedger } from './ledger.mjs';
+import { rosterCalendarWindow } from './roster.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVICES = ['gmail', 'calendar', 'slack', 'greenhouse'];
@@ -217,6 +218,8 @@ function readProblem(receipt, all = []) {
   if (receipt.name.endsWith('__slack_search_public_and_private') && !slackResultsRecognized(d)) return 'Slack response shape is unrecognized';
   if (receipt.name.endsWith('__get_my_job') && String(d?.data?.id) !== JOB_ID) return 'Greenhouse job did not return the pilot job';
   if (receipt.name.endsWith('__search_my_interviews') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse interview response shape is unrecognized';
+  if (receipt.name.endsWith('__search_my_applications') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse application response shape is unrecognized';
+  if (receipt.name.endsWith('__search_my_candidates') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse candidate response shape is unrecognized';
   if (receipt.name.endsWith('__search_threads') && !Array.isArray(d?.threads ?? d?.data?.threads) &&
     !(d && typeof d === 'object' && !Array.isArray(d) && Object.keys(d).length === 0)) return 'Gmail search response shape is unrecognized';
   if (receipt.name.endsWith('__get_thread') && !fullThread(receipt, all)) return 'Gmail thread lacks full bodies for every message';
@@ -431,7 +434,7 @@ export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, cl
     const scanSince = previous ? Date.parse(previous.scanned_at) - 2 * 60 * MINUTE : now - 7 * 24 * 60 * MINUTE;
     const day = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(scanSince)).map(p => [p.type, p.value]));
     const ledger = summarizeLedger(dataDir);
-    const context = { allowed_tools: ALLOWED, now: iso(now), timezone: 'America/Los_Angeles', scan_since: iso(scanSince), scan_since_date_pacific: `${day.year}/${day.month}/${day.day}`, upcoming_until: iso(now + 14 * 24 * 60 * MINUTE), previous_episodes: (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed'), ledger };
+    const context = { allowed_tools: ALLOWED, now: iso(now), timezone: 'America/Los_Angeles', scan_since: iso(scanSince), scan_since_date_pacific: `${day.year}/${day.month}/${day.day}`, upcoming_until: iso(now + 14 * 24 * 60 * MINUTE), roster_window: rosterCalendarWindow(now), previous_episodes: (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed'), ledger };
     const prompt = fs.readFileSync(path.join(HERE, 'prompt.md'), 'utf8') + '\n\n<scan_context>\n' + JSON.stringify(context) + '\n</scan_context>';
     streamFd = fs.openSync(path.join(dataDir, 'latest-stream.jsonl'), 'w', 0o600);
     stderrFd = fs.openSync(path.join(dataDir, 'latest-stderr.txt'), 'w', 0o600);

@@ -6,8 +6,8 @@ This interactive session acts as Sam Vangelos (`sam.vangelos@turing.com`, Greenh
 
 ## Boot sequence (run immediately at session start, before taking instructions)
 
-1. **Read shared state**: Read `~/.recruiting-agents/scheduling-pilot/ledger.jsonl` (deduped by `idempotency_key`), `~/.recruiting-agents/scheduling-pilot/checkpoint.json`, and `~/.recruiting-agents/scheduling-pilot/DRAFTS.md`.
-2. **List candidates in play**: Present a concise status table of every open episode with its candidate, current step from `JOB.md` (Steps 1–10), and what is waiting on whom since when (order overdue or approaching 12-hour interviewer chases and 24-hour candidate nudges first).
+1. **Read shared state & build roster**: Read `~/.recruiting-agents/scheduling-pilot/ledger.jsonl` (deduped by `idempotency_key`), `checkpoint.json`, and `DRAFTS.md`. Build the live roster (`worker/roster.mjs`) joining Greenhouse (`search_my_applications(job_ids=[5149015004], status="active")`, `search_my_interviews(job_ids=[5149015004])`, `search_my_candidates`) with primary Google Calendar (today 00:00 Pacific through +7 days plus the past 24 hours) on `interview.external_event_id`, `application_id` in event description, and candidate email.
+2. **Day view & candidates in play**: Present the **day view** first — today's candidate events in chronological order, each with interviewer acceptance and candidate confirmation state (Sam's own Calendly screens appear as roster facts, though the agent does not own that step unless Sam widens `JOB.md`) — followed by all candidates in play with their step from `JOB.md` (Steps 1–10), roster discrepancies, and what is waiting on whom since when.
 3. **Surface unreviewed worker proposals**: List every proposal from `checkpoint.json` / `DRAFTS.md` whose `action_key` has not yet been discharged by an `action` record or declined by an `approval` record in `ledger.jsonl`, including the exact proposed draft or Greenhouse action.
 4. **Take instructions**: Stop and ask Sam which proposals to approve, edit, or decline, or what scheduling action to drive next.
 
