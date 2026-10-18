@@ -34,7 +34,7 @@ The agent schedules the interview in Greenhouse, which puts the event on Sam's c
 
 ### 7. Wait for the interviewer, and chase at 12 hours
 
-An acceptance leads to step 8. When the invite has had no answer 12 hours after it went out, the agent asks the interviewer on Slack whether they can make the time (Sam, 2026-10-15), and a yes leads to step 8. A no or an outright decline means rebooking: into another of the candidate's windows if one is still open on the interviewer's calendar, otherwise back to step 2. Before rebooking, the agent reads the interviewer's Slack, because a decline often comes with a reason or a substitute, as Andrew's "move it to Khiem" did on 2026-10-09.
+An acceptance leads to step 8. When the invite has had no answer 12 hours after it went out, the agent asks the interviewer on Slack whether they can make the time (Sam, 2026-10-15), and a yes leads to step 8. If that message goes unanswered for 24 hours, the agent sends one one-sentence follow-up in the same thread. If the follow-up also goes unanswered for 24 hours, the agent asks the hiring manager on Slack to nudge the interviewer (Sam, 2026-10-17, after Shyam went unanswered on three screens: "If an interviewer on a hiring team has sort of behaved like this, then the step at this point would be to ping the hiring manager and be like, hey, can you nudge this person for me?"). A no or an outright decline means rebooking: into another of the candidate's windows if one is still open on the interviewer's calendar, otherwise back to step 2. Before rebooking, the agent reads the interviewer's Slack, because a decline often comes with a reason or a substitute, as Andrew's "move it to Khiem" did on 2026-10-09.
 
 ### 8. Confirm to the candidate from Greenhouse
 
