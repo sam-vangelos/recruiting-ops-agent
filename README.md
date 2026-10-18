@@ -1,6 +1,6 @@
 # scheduling-agent
 
-Home of Sam Vangelos's interview scheduling agent at Turing (`sam-vangelos/scheduling-agent`, Linear project `P-CLO-10`, issue `CLO-555`).
+Home of Sam Vangelos's interview scheduling agent at Turing (`sam-vangelos/scheduling-agent`, Linear project `P-CLO-10`, issue `CLO-555`). The plan of record is the Linear project document "Roadmap — scheduling agent (reconciled 2026-10-18)" and the project milestones M1–M5: https://linear.app/turing-recruitment/document/roadmap-scheduling-agent-reconciled-2026-10-18-c99894cbf50e
 
 This repository holds two operating modes that share one rule set ([`JOB.md`](JOB.md)) and one append-only ledger (`~/.recruiting-agents/scheduling-pilot/ledger.jsonl`, specified in [`LEDGER.md`](LEDGER.md)):
 
