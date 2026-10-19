@@ -14,7 +14,7 @@ This starts when a hiring manager approves, in the role's Slack channel or a dir
 
 ### 2. Ask the candidate for availability
 
-Once step 1 is done, the agent sends Greenhouse's availability request from the application, so the request is logged on the candidate's profile. If the candidate has not answered 24 hours later, the agent sends one nudge, and if the nudge also goes unanswered for 24 hours, it tells Sam (Sam, 2026-10-16: "one nudge after 24 hours, then a note to me").
+Once step 1 is done, the agent sends Greenhouse's availability request from the application, so the request is logged on the candidate's profile. If the candidate has not answered 24 hours later, the agent sends one nudge, and if the nudge also goes unanswered for 24 hours, it tells Sam (Sam, 2026-10-16: "one nudge after 24 hours, then a note to me"). These hours, and every timer in step 7, count working hours in the recipient's time zone, Monday to Friday, so an invite sent on a Friday afternoon is not chased on Saturday night (Sam, 2026-10-18, after the external review showed a Friday 15:49 UTC invite falling due at 20:49 Pacific that night).
 
 ### 3. Watch for the candidate's times
 
@@ -34,7 +34,7 @@ The agent schedules the interview in Greenhouse, which puts the event on Sam's c
 
 ### 7. Wait for the interviewer, and chase at 12 hours
 
-An acceptance leads to step 8. When the invite has had no answer 12 hours after it went out, the agent asks the interviewer on Slack whether they can make the time (Sam, 2026-10-15), and a yes leads to step 8. If that message goes unanswered for 24 hours, the agent sends one one-sentence follow-up in the same thread. If the follow-up also goes unanswered for 24 hours, the agent asks the hiring manager on Slack to nudge the interviewer (Sam, 2026-10-17, after Shyam went unanswered on three screens: "If an interviewer on a hiring team has sort of behaved like this, then the step at this point would be to ping the hiring manager and be like, hey, can you nudge this person for me?"). A no or an outright decline means rebooking: into another of the candidate's windows if one is still open on the interviewer's calendar, otherwise back to step 2. Before rebooking, the agent reads the interviewer's Slack, because a decline often comes with a reason or a substitute, as Andrew's "move it to Khiem" did on 2026-10-09.
+An acceptance leads to step 8. The 12 and 24 hours below are working hours in the interviewer's zone, as step 2 says (Sam, 2026-10-18). When the invite has had no answer 12 hours after it went out, the agent asks the interviewer on Slack whether they can make the time (Sam, 2026-10-15), and a yes leads to step 8. If that message goes unanswered for 24 hours, the agent sends one one-sentence follow-up in the same thread. If the follow-up also goes unanswered for 24 hours, the agent asks the hiring manager on Slack to nudge the interviewer (Sam, 2026-10-17, after Shyam went unanswered on three screens: "If an interviewer on a hiring team has sort of behaved like this, then the step at this point would be to ping the hiring manager and be like, hey, can you nudge this person for me?"). A no or an outright decline means rebooking: into another of the candidate's windows if one is still open on the interviewer's calendar, otherwise back to step 2. Before rebooking, the agent reads the interviewer's Slack, because a decline often comes with a reason or a substitute, as Andrew's "move it to Khiem" did on 2026-10-09.
 
 ### 8. Confirm to the candidate from Greenhouse
 
@@ -42,7 +42,7 @@ The agent sends Greenhouse's interview confirmation with the template the dialog
 
 ### 9. Keep watch until the interview
 
-From confirmation until the interview starts, the agent reads both sides' email, Slack and calendar replies. A request to move, from either side, goes back to step 3 or 4 with the new times, and the Greenhouse interview moves with it so only one booking is ever live. A cancellation frees the interviewer's time in Greenhouse and tells the other side. A candidate who withdraws goes to the systems agent.
+From confirmation until the interview starts, the agent reads both sides' email, Slack and calendar replies. A request to move, from either side, goes back to step 3 or 4 with the new times, and the Greenhouse interview moves with it so only one booking is ever live. A cancellation frees the interviewer's time in Greenhouse and tells the other side. When the interviewer is the one who cancels, the candidate is told at once, without waiting for Sam's tick, because a notice that waits can arrive after the candidate has joined an empty call (Sam, 2026-10-18). A candidate who withdraws goes to the systems agent.
 
 ### 10. Run the interview day
 
@@ -64,7 +64,7 @@ Sam ruled on 2026-10-16 that the interview itself is part of the job, and that a
 
 ## Which steps wait for Sam's OK
 
-During the pilot, every message to a candidate or an interviewer waits for Sam's tick, with two standing exceptions: Greenhouse record changes such as the stage move and job access go ahead without asking, and so does the Greenhouse confirmation in step 8 (Sam, 2026-10-14). The nudges in step 10 also go out without asking, because a nudge that waits for a tick lands after the moment has passed (Sam, 2026-10-16: "yes").
+During the pilot, every message to a candidate or an interviewer waits for Sam's tick, with two standing exceptions: Greenhouse record changes such as the stage move and job access go ahead without asking, and so does the Greenhouse confirmation in step 8 (Sam, 2026-10-14). The nudges in step 10 also go out without asking, because a nudge that waits for a tick lands after the moment has passed (Sam, 2026-10-16: "yes"), and so does the notice to a candidate whose interviewer has cancelled (step 9; Sam, 2026-10-18). The tick is a quality control, not a legal one: Sam ruled on 2026-10-18 that this agent carries no legal or disclosure requirement ("Assume we don't have to worry about legal stuff with this agent at all"), so candidate messages need no AI disclosure line and no step waits on a legal review.
 
 ## What step 10 needs before it can run
 
