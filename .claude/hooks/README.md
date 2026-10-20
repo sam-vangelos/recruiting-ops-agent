@@ -6,9 +6,11 @@ This Claude Code `PreToolUse` hook stops the interactive scheduling session from
 
 The hook looks only at MCP tool calls and matches them by the end of the tool name, because the server prefix differs per user. The `TOOLS` table at the top of `send-gate.mjs` holds the classification, and extending it means adding a row.
 
-Message tools get the verbatim check: Gmail `send_message`, `reply` and `forward`, and Slack `slack_send_message` and `slack_schedule_message`. A call goes through only when Sam replied after the wording was shown to him. Concretely, the hook finds Sam's latest message in the session transcript and the one before it, takes the assistant's chat text printed between the two, and requires the outgoing body to appear in that text. For a Gmail call it also requires every `to`, `cc` and `bcc` address, the subject line, and every link URL in an `htmlBody` to appear there. A send by `draftId`, an empty body, a call from a subagent, and a transcript that cannot be read or parsed are all denied.
+Message tools get the verbatim check: Gmail `send_message`, `reply` and `forward`, and Slack `slack_send_message` and `slack_schedule_message`. A call is let through only when Sam replied after the wording was shown to him. Concretely, the hook finds Sam's latest message in the session transcript and the one before it, takes the assistant's chat text printed between the two, and requires the outgoing body to appear in that text. For a Gmail call it also requires every `to`, `cc` and `bcc` address, the subject line, and every link URL in an `htmlBody` to appear there. A send by `draftId`, an empty body, a call from a subagent, and a transcript that cannot be read or parsed are all denied.
 
-Calendar, Calendly, Notion calendar, Slack canvas and Greenhouse `apply_*` writes have no single body to compare, so the hook answers `ask`, and Claude Code then shows Sam the exact tool input in a permission prompt that the model cannot answer for him. Drafts (`create_draft`, `update_draft`, `slack_send_message_draft`), Greenhouse `preview_*` tools, Gmail label tools and every read pass through without a decision.
+Calendar, Calendly, Notion calendar, Slack canvas and Greenhouse writes have no single body to compare. The Greenhouse writes are the recruiter server's `apply_*` tools and the other Greenhouse server's `reject_application`, `unreject_application`, `move_application`, `delete_application`, `create_application`, `create_candidate`, `update_candidate`, `add_candidate_note` and `create_job`. For all of these the hook answers `ask`, and Claude Code then shows Sam the exact tool input in a permission prompt that the model cannot answer for him. Drafts (`create_draft`, `update_draft`, `slack_send_message_draft`), Greenhouse `preview_*` tools, Gmail label tools and every read pass through without a decision.
+
+The gate never answers `allow`. A send whose wording Sam saw, and a call covered by an exception below, get no output at all, so Claude Code's normal permission rules still decide them and a teammate's own `ask` or `deny` rule for a tool stays in force. The gate can only tighten what those rules permit.
 
 ## How to show a draft so it passes
 
@@ -20,13 +22,13 @@ Print the full message as ordinary chat text in the reply that asks Sam: greetin
 
 | `exception` | Covers |
 | --- | --- |
-| `step1_stage_move` | Greenhouse `apply_application_stage_move` |
+| `step1_stage_move` | the recruiter server's `apply_application_stage_move` |
 | `step6_interviewer_role` | a Greenhouse `apply_*` tool whose name mentions a permission or role |
 | `step8_standard_confirmation` | a Greenhouse `apply_*` tool whose name mentions an interview or confirmation |
 | `step9_urgent_cancellation` | any message tool, when `draft_sha256` matches the body |
 | `step10_live_nudge` | any message tool, when `draft_sha256` matches the body |
 
-An intent already followed by a `dispatched` record with the same `action_key` no longer counts, and neither does one dated in the future. To get the `draft_sha256` for a message, pipe the exact tool input to the hook: `echo '<tool_input json>' | node .claude/hooks/send-gate.mjs --hash <tool_name>`. Every send allowed this way appends one line to `~/.recruiting-agents/scheduling-pilot/send-gate.log` (overridable with `SCHEDULING_SEND_GATE_LOG`) with the time, tool, exception and `action_key`, never the body.
+An intent already followed by a `dispatched` record with the same `action_key` no longer counts, and neither does one dated in the future. An exception lifts the gate's own `deny` or `ask` and nothing more; the session's permission rules still apply. None covers the other Greenhouse server's writes, which always ask. To get the `draft_sha256` for a message, pipe the exact tool input to the hook: `echo '<tool_input json>' | node .claude/hooks/send-gate.mjs --hash <tool_name>`. Every call let through this way appends one line to `~/.recruiting-agents/scheduling-pilot/send-gate.log` (overridable with `SCHEDULING_SEND_GATE_LOG`) with the time, tool, exception and `action_key`, never the body.
 
 ## What the gate does not cover
 
@@ -36,6 +38,7 @@ An intent already followed by a `dispatched` record with the same `action_key` n
 - The thread a Gmail `reply` lands in, its implicit recipients, the original message a `forward` carries, and the channel a Slack message goes to.
 - Honest ledger records. An exception relies on the model writing a truthful intent record, and the log is the audit trail for checking that it did.
 - Permission modes that skip prompts: the `ask` path depends on Claude Code showing the permission prompt in the mode the session runs in.
+- What the session's own permission rules allow. When the gate passes a call it stays silent, so a send Sam saw, or one covered by an exception, still goes through whatever `ask` or `deny` rules the user has configured, and is not forced through by the gate.
 
 ## Tests
 

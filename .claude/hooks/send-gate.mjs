@@ -2,8 +2,11 @@
 // send-gate: a Claude Code PreToolUse hook that blocks any outward message whose exact
 // wording Sam has not seen on screen. See README.md beside this file.
 //
-// Contract: JSON hook input on stdin; for a decision, JSON on stdout and exit 0; for a
-// tool the gate does not care about, exit 0 with no output. Plain Node, no dependencies.
+// Contract: JSON hook input on stdin; for a deny or ask, JSON on stdout and exit 0.
+// Everything else exits 0 with no output: an unclassified tool, a send whose wording Sam
+// saw, and a call covered by a ledger exception. The gate never answers "allow", so it
+// only ever tightens and a user's own ask/deny permission rules stay in force.
+// Plain Node, no dependencies.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -47,6 +50,8 @@ export const TOOLS = [
   { pattern: /meetings-create_invitee$/, kind: 'ask' },
   // Greenhouse recruiter writes (preview_* are read-only and match nothing here)
   { pattern: /__apply_[a-z_]+$/, kind: 'ask' },
+  // The other Greenhouse server's writes. No exception names them, so they always ask.
+  { pattern: /__(reject_application|unreject_application|move_application|delete_application|create_application|create_candidate|update_candidate|add_candidate_note|create_job)$/, kind: 'ask' },
 ];
 
 // JOB.md "Which steps wait for Sam's OK". An exception is claimed by a fresh ledger intent
@@ -350,7 +355,7 @@ function gateMessage(row, input) {
   const exc = findException({ kind: 'message', toolName, hash: draftHash(out.parts) });
   if (exc.record) {
     logException(toolName, exc.record, input.session_id);
-    return decision('allow', `Allowed by ledger exception ${exc.record.exception} (${exc.record.action_key ?? 'no action_key'}).`);
+    return null;
   }
   const excNote = exc.note ? ` (${exc.note})` : '';
 
@@ -372,7 +377,7 @@ function gateMessage(row, input) {
   if (out.unparsedRecipients.length) misses.push('a recipient field with no readable address');
   const missingLinks = out.links.filter(u => !hay.raw.includes(normalize(u)));
   if (missingLinks.length) misses.push(`link URL(s) ${missingLinks.join(', ')}`);
-  if (!misses.length) return decision('allow', `Sam saw this exact ${what} before his latest message.`);
+  if (!misses.length) return null; // Sam saw this exact wording: no opinion, normal permissions apply
   return decision('deny', `Blocked: this ${what} has not been shown to Sam verbatim before his latest message; missing from what he saw: ${misses.join('; ')}. ${SHOW_HOW}${excNote}`);
 }
 
@@ -382,7 +387,7 @@ function gateAsk(row, input) {
     const exc = findException({ kind: 'ask', toolName });
     if (exc.record) {
       logException(toolName, exc.record, input.session_id);
-      return decision('allow', `Allowed by ledger exception ${exc.record.exception} (${exc.record.action_key ?? 'no action_key'}).`);
+      return null;
     }
   }
   return decision('ask', 'Outward write: Sam must approve this exact tool input.');

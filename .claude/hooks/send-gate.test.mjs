@@ -18,6 +18,8 @@ const GMAIL_B = 'mcp__claude_ai_Gmail';
 const SLACK = 'mcp__8da37aa4-0000-4000-8000-000000000002';
 const CAL = 'mcp__886429e7-0000-4000-8000-000000000003';
 const GH = 'mcp__greenhouse-recruiter';
+const GH_LEGACY = 'mcp__293a8f50-0000-4000-8000-000000000004';
+const GH_LEGACY_B = 'mcp__claude_ai_Greenhouse';
 
 const BODY = 'Hi X, so sorry I missed our call -- could you grab a new slot on my Calendly?';
 const BODY_NORMALISED = 'Hi X, so sorry I missed our call \u2014 could you grab a new slot on my Calendly?';
@@ -77,7 +79,7 @@ function runHook(dir, input, { ledger = [] } = {}) {
   assert.equal(res.status, 0, `hook exited ${res.status}: ${res.stderr}`);
   const out = res.stdout.trim();
   const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
-  if (!out) return { decision: null, reason: null, log };
+  if (!out) return { decision: null, reason: null, log, stdout: res.stdout };
   const parsed = JSON.parse(out);
   const h = parsed.hookSpecificOutput;
   assert.equal(h.hookEventName, 'PreToolUse');
@@ -121,7 +123,15 @@ test('replay of the incident: drafts never printed, "approve all" reply, reply c
 
 test('body quoted verbatim (italics, quote marker, em dash for --) before the human reply is allowed', t => {
   const r = gate(t, [human('Draft the apology.'), think('Draft it.'), say(SHOWN), human('Yes, send it.')], `${GMAIL}__reply`, { messageId: 'm-1', body: BODY });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
+});
+
+test('a passing send produces empty stdout: the gate has no opinion, it never grants', t => {
+  const r = gate(t, [human('Draft the apology.'), say(SHOWN), human('Yes, send it.')], `${GMAIL}__reply`, { messageId: 'm-1', body: BODY });
+  assert.equal(r.stdout, '');
+  const exc = gate(t, replayTurn(), `${GH}__apply_application_stage_move`, {}, { ledger: [intent('step1_stage_move')] });
+  assert.equal(exc.stdout, '');
+  assert.ok(exc.log.includes('step1_stage_move'), 'an exception pass is still logged');
 });
 
 test('body shown but no human message since: denied', t => {
@@ -163,7 +173,7 @@ test('non-human user entries do not count as Sam replying', t => {
 
 test('a mid-turn human message (queued_command attachment) counts as Sam replying', t => {
   const r = gate(t, [human('Draft.'), say(SHOWN), enqueue('Looks right, send.'), dequeue(), queuedHuman('Looks right, send.')], `${GMAIL}__reply`, { messageId: 'm-1', body: BODY });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
 });
 
 test('text printed after Sam submitted a queued message but before it was delivered does not count', t => {
@@ -186,7 +196,7 @@ test('Gmail send_message: a to address not shown is denied, shown is allowed', t
   assert.match(denied.reason, /recipient/i);
   const shownAll = `To: Candidate.One@example.com\n${shownNoAddr}`;
   const allowed = gate(t, [human('Draft.'), say(shownAll), human('Send.')], `${GMAIL}__send_message`, input);
-  assert.equal(allowed.decision, 'allow', allowed.reason);
+  assert.equal(allowed.decision, null, allowed.reason);
 });
 
 test('Gmail send_message: a subject not shown is denied', t => {
@@ -210,18 +220,18 @@ test('htmlBody: an href not shown is denied; shown as a markdown link is allowed
   assert.match(denied.reason, /link/i);
   const withLink = 'Draft:\n\nHi X, so sorry I missed our call -- could you grab a new slot on my [Calendly](https://calendly.example/sam)?';
   const allowed = gate(t, [human('Draft.'), say(withLink), human('Send.')], `${GMAIL}__reply`, { messageId: 'm-1', htmlBody: html });
-  assert.equal(allowed.decision, 'allow', allowed.reason);
+  assert.equal(allowed.decision, null, allowed.reason);
 });
 
 test('Gmail forward: forwardText and to are checked', t => {
   const input = { messageId: 'm-1', to: 'hm.one@example.com', forwardText: 'FYI, see below.' };
-  assert.equal(gate(t, [human('Fwd.'), say('Forward to hm.one@example.com with: FYI, see below.'), human('Go.')], `${GMAIL}__forward`, input).decision, 'allow');
+  assert.equal(gate(t, [human('Fwd.'), say('Forward to hm.one@example.com with: FYI, see below.'), human('Go.')], `${GMAIL}__forward`, input).decision, null);
   assert.equal(gate(t, [human('Fwd.'), say('Forward with: FYI, see below.'), human('Go.')], `${GMAIL}__forward`, input).decision, 'deny');
 });
 
 test('Slack message with a <@U123> mention, shown without the token: allowed', t => {
   const r = gate(t, [human('Draft.'), say('Slack draft: "Can you make Tuesday at 2pm PT?"'), human('Send.')], `${SLACK}__slack_send_message`, { channel_id: 'C000', message: '<@U123> Can you make Tuesday at 2pm PT?' });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
 });
 
 test('Slack schedule_message is gated the same way', t => {
@@ -231,7 +241,7 @@ test('Slack schedule_message is gated the same way', t => {
 
 test('slack_send_message is not treated as Gmail send_message (no recipient rule)', t => {
   const r = gate(t, [human('Draft.'), say('Slack: Can you make Tuesday at 2pm PT?'), human('Send.')], `${SLACK}__slack_send_message`, { channel_id: 'C000', message: 'Can you make Tuesday at 2pm PT?', to: 'nobody@example.com' });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
 });
 
 test('slack_send_message_draft, Gmail create_draft and update_draft pass through', t => {
@@ -267,7 +277,7 @@ test('an unterminated final line (write in progress) is ignored, not fatal', t =
   const file = path.join(dir, 'transcript.jsonl');
   fs.writeFileSync(file, [human('Draft.'), say(SHOWN), human('Send.')].map(e => JSON.stringify(e)).join('\n') + '\n{"type":"assist');
   const r = runHook(dir, { transcript_path: file, tool_name: `${GMAIL}__reply`, tool_input: { messageId: 'm-1', body: BODY } });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
 });
 
 test('unparseable hook input: denied', t => {
@@ -288,9 +298,23 @@ test('calendar create_event and Greenhouse stage move ask Sam', t => {
   }
 });
 
-test('stage move with a fresh step1_stage_move intent is allowed and logged without a body', t => {
+test('the other Greenhouse server: writes ask under any prefix and take no exception; reads pass', t => {
+  const writes = ['reject_application', 'unreject_application', 'move_application', 'delete_application', 'create_application', 'create_candidate', 'update_candidate', 'add_candidate_note', 'create_job'];
+  const ledger = Object.keys({ step1_stage_move: 1, step6_interviewer_role: 1, step8_standard_confirmation: 1 }).map((e, i) => intent(e, { idempotency_key: `act:${e}:${i}` }));
+  for (const prefix of [GH_LEGACY, GH_LEGACY_B]) {
+    for (const name of writes) {
+      assert.equal(gate(t, replayTurn(), `${prefix}__${name}`, {}).decision, 'ask', `${prefix}__${name}`);
+      assert.equal(gate(t, replayTurn(), `${prefix}__${name}`, {}, { ledger }).decision, 'ask', `${prefix}__${name} with exceptions`);
+    }
+    for (const name of ['list_applications', 'get_job', 'search_candidates']) {
+      assert.equal(gate(t, null, `${prefix}__${name}`, {}).decision, null, `${prefix}__${name}`);
+    }
+  }
+});
+
+test('stage move with a fresh step1_stage_move intent passes silently and is logged without a body', t => {
   const r = gate(t, replayTurn(), `${GH}__apply_application_stage_move`, { application_id: 1 }, { ledger: [intent('step1_stage_move')] });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
   const line = JSON.parse(r.log.trim());
   assert.equal(line.tool, `${GH}__apply_application_stage_move`);
   assert.equal(line.exception, 'step1_stage_move');
@@ -334,7 +358,7 @@ test('message with a step10_live_nudge intent and matching hash is allowed and l
   const message = 'The interview has started: https://meet.example/abc-defg-hij';
   const hash = sha(message);
   const r = gate(t, replayTurn(), `${SLACK}__slack_send_message`, { channel_id: 'D000', message }, { ledger: [intent('step10_live_nudge', { draft_sha256: hash })] });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
   assert.equal(JSON.parse(r.log.trim()).exception, 'step10_live_nudge');
   assert.ok(!r.log.includes('interview has started'), 'log must not carry the body');
 });
@@ -355,7 +379,7 @@ test('the --hash helper prints the digest the gate expects', t => {
   const hash = res.stdout.trim();
   assert.match(hash, /^[0-9a-f]{64}$/);
   const r = gate(t, replayTurn(), `${GMAIL_B}__reply`, { messageId: 'm-1', body: BODY }, { ledger: [intent('step9_urgent_cancellation', { draft_sha256: hash })] });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, null, r.reason);
 });
 
 test('a subagent may not use a message exception either', t => {
@@ -375,7 +399,7 @@ test('read tools produce no output', t => {
 test('the same tool names under different server prefixes behave the same', t => {
   const entries = [human('Draft.'), say(SHOWN), human('Send.')];
   for (const prefix of ['mcp__ac613b5b-0000-4000-8000-000000000001', 'mcp__0f0f0f0f-1111-4222-8333-444444444444', 'mcp__claude_ai_Gmail']) {
-    assert.equal(gate(t, entries, `${prefix}__reply`, { messageId: 'm-1', body: BODY }).decision, 'allow', prefix);
+    assert.equal(gate(t, entries, `${prefix}__reply`, { messageId: 'm-1', body: BODY }).decision, null, prefix);
     assert.equal(gate(t, replayTurn(), `${prefix}__reply`, { messageId: 'm-1', body: BODY }).decision, 'deny', prefix);
     assert.equal(gate(t, replayTurn(), `${prefix}__create_event`, {}).decision, 'ask', prefix);
     assert.equal(gate(t, replayTurn(), `${prefix}__get_thread`, {}).decision, null, prefix);
