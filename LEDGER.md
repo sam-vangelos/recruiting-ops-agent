@@ -1,16 +1,17 @@
-# Shared Scheduling Ledger (`ledger.jsonl`)
+# Shared Scheduling Ledger (`ledger.jsonl`) & Authoritative SQLite Coordinator (`state.sqlite`)
 
-The ambient worker (`worker/pilot.mjs`) and the interactive Claude Code harness (`CLAUDE.md`) coordinate through one append-only JSON Lines file:
+The ambient worker (`worker/pilot.mjs`), the deterministic in-process executor (`worker/executor-tick.mjs` / `src/executor/index.ts`), and the interactive Claude Code harness (`CLAUDE.md`) coordinate through two local stores in `~/.recruiting-agents/scheduling-pilot/` (mode `0700` directory, `0600` files, never committed to Git):
 
-- **Default path**: `~/.recruiting-agents/scheduling-pilot/ledger.jsonl` (mode `0600` inside a `0700` directory, never committed to Git).
-- **Implementation**: [`worker/ledger.mjs`](worker/ledger.mjs) (`append`, `read`, `dedupe`, `summarizeLedger`, `isActionDischarged`).
+- **Authoritative SQLite Coordinator (`state.sqlite` in WAL mode)**: Implemented in [`src/store/sqlite.ts`](src/store/sqlite.ts). Owns the single-writer execution lock (`BEGIN IMMEDIATE` / `writer_lease`), episode state (`episodes`), multi-step chain state (`chain_steps`), authenticated 16-hex SHA-256 proposal approvals (`approvals`), and local deliberation/reminder timers (`timers`).
+- **Backward-Compatible Shared Ledger (`ledger.jsonl`)**: Implemented in [`worker/ledger.mjs`](worker/ledger.mjs) (`append`, `read`, `dedupe`, `dischargedKeys`, `summarizeLedger`, `isActionDischarged`) and consumed by [`.claude/hooks/send-gate.mjs`](.claude/hooks/send-gate.mjs).
 
 ## Invariants
 
-1. **Persist before dispatch**: Before the interactive session executes any outward step (sending an email, posting to Slack, scheduling or confirming in Greenhouse, modifying a calendar event), it appends an `action` record with `status: "intent"` and a deterministic `idempotency_key`. When the provider call completes, the session appends a second `action` record with the same `idempotency_key`, `status: "dispatched"`, and the returned `provider_id`.
-2. **Idempotent deduplication**: `dedupe(records)` folds records by `idempotency_key` so the latest record for a given `idempotency_key` supersedes earlier ones while preserving earlier fields not overwritten.
-3. **Never re-propose handled work**: At the start of each scan, `worker/pilot.mjs` reads and deduplicates `ledger.jsonl`, passes the ledger summary in `<scan_context>` to Claude, and strips any `next_actions` whose `action_key` (or `<episode_id>/<action_key>`) has been discharged by an `action` record or declined by an `approval` record before writing `checkpoint.json` and `DRAFTS.md`.
-4. **Timer anchoring**: Wait rules (`12h_interviewer_chase`, `24h_candidate_nudge`, `48h_candidate_escalate`) start from `wait.since` in the ledger when present.
+1. **Persist before dispatch**: Before the Executor or interactive session executes any outward step (sending an email, posting to Slack, scheduling or confirming in Greenhouse, modifying a calendar event), it appends an `action` record with `status: "intent"` and a deterministic `idempotency_key` to `ledger.jsonl` (and `chain_steps` in `state.sqlite`). When the provider call completes, it appends a second `action` record with the same `idempotency_key`, `status: "dispatched"`, and the returned `provider_id`.
+2. **Idempotent monotonic deduplication**: `dedupe(records)` folds records by `idempotency_key` so the latest record for a given `idempotency_key` supersedes earlier ones while preserving earlier fields not overwritten and enforcing monotonic status (`dispatched` / `succeeded` / `reconciled` is never downgraded to `intent`).
+3. **Discharged work vs. unresolved intents**: Only `action` records with `status: "dispatched"` (or `"succeeded"` / `"reconciled"`) count as discharged work in `dischargedKeys()` and `summarizeLedger().discharged_action_keys`. An interrupted `status: "intent"` with no matching terminal record surfaces in `summarizeLedger().unresolved_intents` (`reconciliation_status: "unresolved_intent"`) and `unresolved_action_keys` so it is reconciled against live state before any retry.
+4. **Never re-propose handled work**: At the start of each scan, `worker/pilot.mjs` reads and deduplicates `ledger.jsonl`, passes the ledger summary in `<scan_context>` to Claude, and strips any `next_actions` whose `action_key` (or `<episode_id>/<action_key>`) has been discharged by a terminal `action` record or declined by an `approval` record before writing `checkpoint.json` and `DRAFTS.md`.
+5. **Timer anchoring**: Wait rules (`12h_interviewer_chase`, `24h_interviewer_chase`, `24h_scorecard_chase`, `24h_candidate_nudge`, `48h_candidate_escalate`, `wf4_deliberation`) start from `wait.since` in the ledger and `timers.fire_at` in `state.sqlite`.
 
 ## Record kinds
 
@@ -18,7 +19,7 @@ Every line is one JSON object with `kind`, `idempotency_key` (non-empty string),
 
 ### 1. `action` — Outward step taken as Sam
 
-Discharges `action_key` (and `<episode_id>/<action_key>`) unless `status === "failed"`.
+Discharges `action_key` (and `<episode_id>/<action_key>`) only when `status` is `"dispatched"`, `"succeeded"`, or `"reconciled"`. An un-dispatched `status: "intent"` surfaces as `unresolved_intent` requiring reconciliation before retry.
 
 ```json
 {
@@ -39,12 +40,12 @@ Discharges `action_key` (and `<episode_id>/<action_key>`) unless `status === "fa
 - `episode_id`: Application ID + interview step when known, else `gmail:<thread_id>` or `slack:<channel>:<ts>`.
 - `action_key`: Episode + action kind discharged by this step.
 - `service`: `"gmail"` | `"greenhouse"` | `"slack"` | `"calendar"`.
-- `status`: `"intent"` (written before dispatch) | `"dispatched"` (written after provider confirmation) | `"failed"`.
-- `provider_id`: Gmail message ID, Greenhouse interview/application ID, Slack message `ts`, or Google Calendar event ID (`null` while `status === "intent"`).
+- `status`: `"intent"` (written before dispatch) | `"dispatched"` (written after provider confirmation) | `"succeeded"` | `"reconciled"` | `"failed"`.
+- `provider_id`: Gmail message ID, Greenhouse interview/application/note ID, Slack message `ts`, or Google Calendar event ID (`null` while `status === "intent"`).
 
 ### 2. `approval` — Sam approved or declined a worker proposal
 
-When `decision === "declined"`, suppresses future worker proposals for `action_key`.
+When `decision === "declined"`, suppresses future worker proposals for `action_key`. When `decision === "approved"`, binds to the 16-hex SHA-256 `proposal_hash` in `state.sqlite`.
 
 ```json
 {
@@ -54,6 +55,7 @@ When `decision === "declined"`, suppresses future worker proposals for `action_k
   "actor": "sam",
   "episode_id": "178089685004:screening-round-14297391004",
   "action_key": "178089685004:screening-round:interviewer-acceptance-nudge",
+  "proposal_hash": "0123456789abcdef",
   "decision": "approved",
   "reason": "Approved combined Slack nudge"
 }
@@ -80,9 +82,9 @@ Records what is waiting on whom since when, and the rule that ends the wait. App
 ```
 
 - `waiting_on`: `"interviewer"` | `"candidate"` | `"hm"` | `"sam"`.
-- `rule`: `"12h_interviewer_chase"` | `"24h_candidate_nudge"` | `"48h_candidate_escalate"` | `"custom"`.
+- `rule`: `"12h_interviewer_chase"` | `"24h_interviewer_chase"` | `"24h_scorecard_chase"` | `"24h_candidate_nudge"` | `"48h_candidate_escalate"` | `"wf4_deliberation"` | `"custom"`.
 
-### 4. `note` — Context for the next reader
+### 4. `note` / `handoff` — Context for the next reader
 
 ```json
 {

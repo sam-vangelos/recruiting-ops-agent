@@ -36,7 +36,7 @@ Field vocabulary (the renderer accepts no others):
 | `RECRUITER_FIRST_NAME` | "Sam" |
 | `RECRUITER_FULL_NAME` | "Sam Vangelos" |
 | `RECRUITER_TITLE` | Sam's Greenhouse job title |
-| `DISCLOSURE_LINE` | The AI disclosure sentence (CLO-278). Draft until legal rules: "Scheduling for this interview is handled with Turing's AI assistant on Sam's behalf; reply here and Sam reads it directly." |
+| `DISCLOSURE_LINE` | The AI disclosure sentence: "Scheduling for this interview is handled with Turing's AI assistant on Sam's behalf; reply here and Sam reads it directly." |
 | `NEW_INTERVIEW_TIME_CANDIDATE` | For reschedules: the new start in the candidate's zone |
 | `OLD_INTERVIEW_TIME_CANDIDATE` | For reschedules: the start being replaced |
 | `DAYS_SILENT` | For the nudge: digits |

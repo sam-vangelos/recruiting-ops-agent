@@ -491,8 +491,8 @@ function planFromHeld(input: PlanInput): Plan {
     confirmed,
   );
   b.deferred.push(
-    { step: 'gh-interview-create', ledgerKey: b.key('gh-interview-create'), reason: 'greenhouse-mcp preview_interview_create / apply_interview_create (CLO-401), against this event id' },
-    { step: 'gh-note', ledgerKey: b.key('gh-note'), reason: 'greenhouse-mcp apply_candidate_note_create: the private "assistant acted" note (CLO-401)' },
+    { step: 'gh-interview-create', ledgerKey: b.key('gh-interview-create'), reason: 'greenhouse-mcp preview_interview_create / apply_interview_create, against this event id' },
+    { step: 'gh-note', ledgerKey: b.key('gh-note'), reason: 'greenhouse-mcp apply_candidate_note_create: the private "assistant acted" note' },
     { step: 'reminder', ledgerKey: b.key('reminder'), reason: 'candidate-reminder, the day before, once confirmed' },
   );
   return finish(b, { ...common, stateAfterDispatch: transition(b.state, 'candidate_confirmed') });

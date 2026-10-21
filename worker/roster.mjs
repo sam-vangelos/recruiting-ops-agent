@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Roster builder (Sam's 2026-10-16 ruling, CLO-555):
+// Roster builder:
 // Joins Greenhouse active applications + interviews + candidates with primary Google Calendar events
 // on three keys in order of confidence:
 //   1. interview.external_event_id === calendarEvent.id

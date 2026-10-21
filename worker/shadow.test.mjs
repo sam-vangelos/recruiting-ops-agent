@@ -260,6 +260,8 @@ function fixtureEvents() {
     ['slack_search_public_and_private', { filters: { in: 'field-engineering-hiring' } }, { results: [], pagination_info: '' }],
     ['get_my_job', { id: 5149015004 }, { data: { id: 5149015004 }, ok: true }],
     ['search_my_interviews', { job_ids: [5149015004] }, { data: [], nextCursor: null, ok: true, read: { complete: true } }],
+    ['search_my_applications', { job_ids: [5149015004], status: 'active' }, { data: [], ok: true, read: { complete: true } }],
+    ['search_my_candidates', { job_ids: [5149015004] }, { data: [], ok: true, read: { complete: true } }],
   ];
   const events = calls.flatMap(([n, input, result], i) => [
     { type: 'assistant', message: { content: [{ type: 'tool_use', id: `read-${i}`, name: names[n], input }] } },
@@ -373,11 +375,11 @@ test('subjectKey reduces model-chosen episode ids to the application, Gmail thre
     ['gmail:1a11d9f2c33774e5', 'thread:1a11d9f2c33774e5'],
     ['slack:C0C9VEPBAJC:1791999286.444579', 'slack:C0C9VEPBAJC:1791999286.444579'],
     // Haiku's naming of the same work.
-    ['178089685004:shyam-screen', 'app:178089685004'],
+    ['178089685004:dana-screen', 'app:178089685004'],
     ['177214133004:take-home-pending', 'app:177214133004'],
     ['1a11d9f2c33774e5', 'thread:1a11d9f2c33774e5'],
     // Bare fallback: the raw id, lowercased.
-    ['Khiem-Take-Home', 'khiem-take-home'],
+    ['Dana-Take-Home', 'dana-take-home'],
     // A Slack ts is not an application id, and ten digits inside a hex thread id are not one either.
     ['1791999286.444579', '1791999286.444579'],
     ['19a1234567890bcd', 'thread:19a1234567890bcd'],
@@ -400,11 +402,11 @@ function namingPair(t) {
     episode('177214133004:take-home-review', 'closed'),
   ] }) });
   writeRun(d.shadowDir, at(0), { model: 'claude-haiku-5-5', verification: verification({ episodes: [
-    episode('178089685004:shyam-screen', 'open', [['send-slots', 'x y z w'], ['hold', 'q']]),
+    episode('178089685004:dana-screen', 'open', [['send-slots', 'x y z w'], ['hold', 'q']]),
     episode('178089685004:onsite', 'closed'),
     episode('177214133004:take-home-pending', 'open', [['chase', DRAFT]]),
     episode('1a11d9f2c33774e5', 'open'),
-    episode('khiem-take-home', 'open'),
+    episode('dana-take-home', 'open'),
   ] }) });
   return { ...d, score: pair(d) };
 }
@@ -416,7 +418,7 @@ test('episodes are also compared by subject, so different naming of the same wor
   assert.equal(score.episodes.only_shadow.length, 5);
   assert.deepEqual(score.episodes_by_subject, {
     only_live: ['slack:C0C9VEPBAJC:1791999286.444579'],
-    only_shadow: ['khiem-take-home'],
+    only_shadow: ['dana-take-home'],
     both: ['app:178089685004', 'thread:1a11d9f2c33774e5', 'app:177214133004'],
     status_diff: [
       { subject: 'app:178089685004', shadow: 'closed+open', live: 'open' },

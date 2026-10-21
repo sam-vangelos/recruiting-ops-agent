@@ -2,7 +2,7 @@
 id: candidate-reschedule
 channel: gmail-reply
 audience: candidate
-derived_from: new (CLO-284 item 3)
+derived_from: candidate reschedule template
 fields:
   - CANDIDATE_FIRST_NAME
   - INTERVIEWER_NAME

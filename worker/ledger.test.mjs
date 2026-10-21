@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { append, dedupe, isActionDischarged, ledgerPath, read, summarizeLedger, validateRecord } from './ledger.mjs';
+import { append, dedupe, dischargedKeys, isActionDischarged, ledgerPath, read, summarizeLedger, validateRecord } from './ledger.mjs';
 import { ALLOWED } from './gate.mjs';
 import { run as runPilot } from './pilot.mjs';
 import { checkFreshness, renderClaudeMd, renderWorkerPrompt } from '../tools/render.mjs';
@@ -79,7 +79,7 @@ test('ledger append, read, and dedupe by idempotency_key across all record kinds
     at: '2026-10-16T18:00:10.000Z',
     kind: 'wait',
     episode_id: 'app-1000000001-hm_screen',
-    waiting_on: 'interviewer:khiem.doan@turing.com',
+    waiting_on: 'interviewer:dana.okafor@turing.com',
     since: '2026-10-16T18:00:05.000Z',
     rule: '12h_interviewer_chase',
     resolved_at: null,
@@ -203,7 +203,7 @@ test('worker run feeds ledger into scan_context and never re-proposes a discharg
     at: '2026-10-16T19:00:05.000Z',
     kind: 'wait',
     episode_id: 'fictional-episode',
-    waiting_on: 'interviewer:khiem.doan@turing.com',
+    waiting_on: 'interviewer:dana.okafor@turing.com',
     since: '2026-10-16T19:00:00.000Z',
     rule: '12h_interviewer_chase',
     resolved_at: null,
@@ -216,6 +216,8 @@ test('worker run feeds ledger into scan_context and never re-proposes a discharg
     ['slack_search_public_and_private', { filters: { in: 'field-engineering-hiring' } }, { results: [], pagination_info: '' }],
     ['get_my_job', { id: 5149015004 }, { data: { id: 5149015004 }, ok: true }],
     ['search_my_interviews', { job_ids: [5149015004] }, { data: [], nextCursor: null, ok: true, read: { complete: true } }],
+    ['search_my_applications', { job_ids: [5149015004], status: 'active' }, { data: [], ok: true, read: { complete: true } }],
+    ['search_my_candidates', { job_ids: [5149015004] }, { data: [], ok: true, read: { complete: true } }],
   ];
   const events = calls.flatMap(([n, input, result], i) => [
     { type: 'assistant', message: { content: [{ type: 'tool_use', id: `read-${i}`, name: names[n], input }] } },
@@ -280,4 +282,72 @@ test('worker run feeds ledger into scan_context and never re-proposes a discharg
   assert.doesNotMatch(draftsMd, /Discharged draft\./);
   assert.doesNotMatch(draftsMd, /Declined draft\./);
   assert.match(draftsMd, /Chase interviewer in Slack after 12h\./);
+});
+
+test('crashed intent without terminal dispatched/succeeded/reconciled record surfaces as unresolved_intent and is NOT discharged', t => {
+  const dir = temp(t);
+  append(dir, {
+    idempotency_key: 'act:fictional-ep:crashed-step:1',
+    at: '2026-10-16T20:00:00.000Z',
+    kind: 'action',
+    episode_id: 'fictional-ep',
+    action_key: 'crashed-step',
+    service: 'greenhouse',
+    status: 'intent',
+    provider_id: null,
+    summary: 'Started interview creation before crash.',
+  });
+  append(dir, {
+    idempotency_key: 'act:fictional-ep:completed-step:1',
+    at: '2026-10-16T20:01:00.000Z',
+    kind: 'action',
+    episode_id: 'fictional-ep',
+    action_key: 'completed-step',
+    service: 'greenhouse',
+    status: 'succeeded',
+    provider_id: 'gh-int-999',
+    summary: 'Completed interview creation.',
+  });
+  // Monotonic status check: an out-of-order intent with the same idempotency_key must not downgrade succeeded
+  append(dir, {
+    idempotency_key: 'act:fictional-ep:completed-step:1',
+    at: '2026-10-16T20:01:05.000Z',
+    kind: 'action',
+    episode_id: 'fictional-ep',
+    action_key: 'completed-step',
+    service: 'greenhouse',
+    status: 'intent',
+    provider_id: null,
+  });
+
+  assert.deepEqual(dischargedKeys(dir), [
+    'completed-step',
+    'fictional-ep/completed-step',
+  ]);
+  const summary = summarizeLedger(dir);
+  assert.equal(isActionDischarged(summary, 'fictional-ep', 'crashed-step'), false);
+  assert.equal(isActionDischarged(summary, 'fictional-ep', 'completed-step'), true);
+  assert.equal(summary.unresolved_intents.length, 1);
+  assert.equal(summary.unresolved_intents[0].idempotency_key, 'act:fictional-ep:crashed-step:1');
+  assert.equal(summary.unresolved_intents[0].reconciliation_status, 'unresolved_intent');
+  assert.deepEqual(summary.unresolved_action_keys, [
+    'crashed-step',
+    'fictional-ep/crashed-step',
+  ]);
+
+  // Once reconciled, it transitions out of unresolved_intents and into discharged_action_keys
+  append(dir, {
+    idempotency_key: 'act:fictional-ep:crashed-step:1',
+    at: '2026-10-16T20:02:00.000Z',
+    kind: 'action',
+    episode_id: 'fictional-ep',
+    action_key: 'crashed-step',
+    service: 'greenhouse',
+    status: 'reconciled',
+    provider_id: 'gh-int-1000',
+    summary: 'Reconciled against live Greenhouse interview.',
+  });
+  const afterReconcile = summarizeLedger(dir);
+  assert.equal(afterReconcile.unresolved_intents.length, 0);
+  assert.equal(isActionDischarged(afterReconcile, 'fictional-ep', 'crashed-step'), true);
 });

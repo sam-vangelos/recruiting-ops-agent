@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "UNLICENSED",
-  "description": "CLO-430: the interview-scheduling resident's pure planner. Turns a JSON input into the exact Calendar and Gmail payloads WORKFLOW.md describes; dispatches nothing.",
+  "description": "Deterministic TypeScript slot planner, IANA timezone engine, template renderer, and pre-dispatch message guard for the interview scheduling agent.",
   "type": "module",
   "engines": {
     "node": ">=24"

@@ -1,10 +1,17 @@
-# Scheduling planner
+# Deterministic Slot Planner & Pre-Send Guard (`planner/`)
 
-This package is the executable half of [`WORKFLOW.md`](WORKFLOW.md). Given one interview's facts as JSON, it finds the slot, renders every outgoing text from [`templates/`](templates/), builds the exact Google Calendar and Gmail payloads, keys each outward step for the ledger, runs the guard over all of it, and names the next state. It prints that plan and stops; nothing is sent.
+This zero-dependency TypeScript package handles the parts of interview scheduling that an LLM should never improvise: **IANA timezone and daylight-saving arithmetic**, **free/busy slot intersection**, **strict template rendering**, and **deterministic pre-dispatch safety checks**.
+
+Given an interview's inputs as JSON (candidate availability windows, interviewer free/busy blocks, time zones, and current booking state), `planner` computes valid slots, renders outgoing messages from [`templates/`](templates/), builds exact Google Calendar and Gmail payloads, assigns idempotent ledger keys, and runs a 7-rule safety guard over every outgoing payload before anything can be sent.
+
+## Relationship to [`JOB.md`](../JOB.md) and [`worker/`](../worker/)
+
+- **[`planner/`](.)** provides the pure, deterministic slot-finding (`src/slots.ts`), IANA timezone normalization (`src/time.ts`), template compiler (`src/templates.ts`), and pre-send message guard (`src/guard.ts`), originally built around the 4-step calendar-hold state machine documented in [`WORKFLOW.md`](WORKFLOW.md).
+- **[`JOB.md`](../JOB.md) and [`worker/`](../worker/)** define the full 10-step Greenhouse-first operating loop and live MCP orchestration harness.
 
 ## Running it
 
-```
+```sh
 npm install
 npm test                      # node --import tsx --test test/*.test.ts
 npm run typecheck
@@ -12,10 +19,17 @@ npx tsx src/cli.ts plan test/fixtures/plan-held.json
 npx tsx src/cli.ts render candidate-hold-placed fields.json
 ```
 
-`plan` prints the plan as JSON on stdout and exits 0 when every guard check passed, 2 when the guard refused something (the plan still prints, with `dispatchable: false` and every reason), and 1 when the input is invalid. `render` prints one template filled from a JSON object of field values, so a person can read the wording before it is ever used. The three fixtures cover the hold (`plan-held.json`, the 2026-10-08 worked example with fictional people), the confirmation once the interviewer accepts (`plan-accepted.json`), and the case where the candidate's windows fit nobody (`plan-no-fit.json`).
+`plan` prints the computed plan as JSON on stdout and exits `0` when every guard check passes, `2` when the guard refuses an outgoing payload (the plan still prints with `dispatchable: false` and every refusal reason), and `1` when the input schema is invalid. `render` renders a single template from a JSON object of field values for inspection.
 
-The input carries the candidate's windows and the free/busy result the caller already read. `freeBusyRange` says what span that read covered; the planner never proposes a slot outside it, and when it had to search 14 days but the read covered only 7, the plan's `notes` say so. Once a hold exists, the input also carries `interviewerResponse` and `heldSlot`, because free/busy then shows the hold itself as busy and the slot cannot be recomputed.
+The three test fixtures cover:
+- `plan-held.json` — Placing an initial interviewer calendar hold and sending the candidate hold notice.
+- `plan-accepted.json` — Confirming the candidate once the interviewer accepts the calendar hold.
+- `plan-no-fit.json` — Offering calendar-confirmed alternative slots when candidate windows do not overlap with interviewer availability.
 
-## What it does not do
+## Core modules
 
-It makes no network call: no Google, Greenhouse, or Slack client is present, and the package has no runtime dependencies. It does not write the ledger, read a calendar again before the write, or post the Slack nudge and escalation on a clock; those belong to the dispatcher, which wires the spike's `GoogleApi`, `Ledger`, and `dispatchOnce` once the consent in CLO-398 exists. The Greenhouse interview record and the "assistant acted" note appear in the plan only as `deferred` ledger keys until the connector's interview write (CLO-401) ships.
+- [`src/time.ts`](src/time.ts) — Zone-aware formatting and normalization via `Intl.DateTimeFormat`. Maps Greenhouse's non-IANA timezone labels (e.g., `"Eastern Time (US & Canada)"`, `"Asia/Calcutta"`) to canonical IANA identifiers and forbids wall-clock string arithmetic across US/Europe DST transitions.
+- [`src/slots.ts`](src/slots.ts) — Intersects candidate windows against recruiter and interviewer free/busy spans, enforcing working hours in the interviewer's local zone, 15-minute buffers, 30-minute wall-clock alignment, a 2-hour minimum lead time, and daily interview caps. Any calendar that errors on free/busy fails closed (treated as busy).
+- [`src/guard.ts`](src/guard.ts) — Deterministic pre-dispatch verifier checking 7 rules on every outgoing payload: `recipients`, `no-zoom` (enforces Google Meet), `links` (allowlists `meet.google.com`, `app4.greenhouse.io`, and `turing.com`), `confirmed-times` (every clock time in text must match a calendar-confirmed slot), `other-candidates` (blocks cross-candidate name leaks), `placeholders` (blocks unrendered `[Bracket]` tokens), and `word-cap`.
+- [`src/templates.ts`](src/templates.ts) — Strict front-matter template parser and renderer that rejects undeclared or missing merge fields.
+- [`src/states.ts`](src/states.ts) & [`src/plan.ts`](src/plan.ts) — Pure state machine and payload builder. Makes zero network calls and has no runtime dependencies.

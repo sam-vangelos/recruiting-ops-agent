@@ -7,6 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DENIED, verify, changes, run as runPilot, initialize, atomic, takeLock, recoverLock, assess, health, main, markdown } from './pilot.mjs';
 import { permitted, ALLOWED } from './gate.mjs';
+import { renderWorkerPrompt, renderClaudeMd } from '../tools/render.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Runs clean persisted tool results under a Claude projects directory; tests never point it at the real one.
 const PROJECTS = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduling-pilot-projects-'));
@@ -21,6 +22,8 @@ function fixture() {
     ['slack_search_public_and_private', { filters: { in: 'field-engineering-hiring' } }, { results: [], pagination_info: '' }],
     ['get_my_job', { id: 5149015004 }, { data: { id: 5149015004 }, ok: true }],
     ['search_my_interviews', { job_ids: [5149015004] }, { data: [], nextCursor: null, ok: true, read: { complete: true } }],
+    ['search_my_applications', { job_ids: [5149015004], status: 'active' }, { data: [], ok: true, read: { complete: true } }],
+    ['search_my_candidates', { job_ids: [5149015004] }, { data: [], ok: true, read: { complete: true } }],
   ];
   const events = calls.flatMap(([n, input, result], i) => [
     { type: 'assistant', message: { content: [{ type: 'tool_use', id: `read-${i}`, name: names[n], input }] } },
@@ -87,10 +90,15 @@ test('pagination only counts when matching scoped query was followed', () => {
     { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'page2', name: names.search_threads, input: { query: 'different-query', pageToken: 'next-fictional' } }] } },
     { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'page2', content: '{"threads":[]}' }] } });
   const unfollowed = verify(f.events, f.report);
-  assert.equal(unfollowed.ok, true, 'an uncited unfollowed page is a warning');
-  assert.deepEqual(unfollowed.warnings, [{ id: 'read-0', name: names.search_threads, reason: 'Unread or unresolved pagination' }]);
+  assert.equal(unfollowed.ok, false, 'an unfollowed page is fatal even when uncited');
+  assert.ok(unfollowed.errors.includes(`Unread or unresolved pagination: ${names.search_threads}`), unfollowed.errors.join('\n'));
+  assert.deepEqual(unfollowed.warnings, []);
   const cited = structuredClone(f.report); cited.coverage.gmail.receipt_ids.push('read-0');
   assert.equal(verify(f.events, cited).ok, false, 'a cited unfollowed page is fatal');
+  const partial = structuredClone(f.report); partial.coverage.gmail = { complete: false, receipt_ids: [], notes: 'Fictional search left a page unread.' };
+  const declared = verify(f.events, partial);
+  assert.equal(declared.ok, true, declared.errors.join('\n'));
+  assert.deepEqual(declared.warnings.map(x => x.id), ['read-0'], 'a declared-incomplete source keeps its unread page as a warning');
   f.events.at(-3).message.content[0].input.query = 'fictional scheduling';
   const followed = verify(f.events, cited);
   assert.equal(followed.ok, true, followed.errors.join('\n'));
@@ -218,7 +226,7 @@ test('the actual Claude stdin explains every allowed tool and exact Slack discov
   assert.ok(input.includes('A query whose results you will not all open is a query you may not issue, so keep the role terms in every Gmail query and never search the inbox on scheduling words alone.'))
   assert.ok(input.includes('When an interviewer invite has sat unaccepted (needsAction) for 12 hours or more, propose a direct Slack message to that interviewer asking whether they can make the time'));
   assert.ok(input.includes("State times in the time zone the candidate used in their own message; add Pacific in parentheses only when the candidate's zone is not Pacific."));
-  assert.ok(input.includes('n of m messages returned; the remainder are unsent drafts or inaccessible'));
+  assert.ok(input.includes('n of m messages returned; the remainder may be an unsent Sam draft'));
   assert.doesNotMatch(input, /Exhaust every list_drafts page|must explain messageCount/);
 });
 
@@ -278,21 +286,23 @@ test('same-query persisted output recovers with smaller pages only after every p
   assert.deepEqual(verified.recovered_reads, [{ id: 'read-0', name: names.search_threads, reason: 'Gmail search response shape is unrecognized', recovered_by: 'retry-read' }]);
   assert.equal(verified.reads.some(x => x.id === 'read-0'), false);
 });
-test('differently scoped reads never recover a failure; it stays a warning, fatal when sole or cited', () => {
+test('differently scoped reads never recover a failure; the failure is fatal', () => {
   const f = fixture();
   resultOf(f.events, '__list_events').content = 'Output too large; persisted to a local file.';
   assert.equal(verify(f.events, f.report).ok, false, 'the only calendar read failed');
   appendRead(f, 'list_events', { calendarId: 'different-calendar', pageSize: 10 }, { events: [] });
   const other = verify(f.events, f.report);
   assert.deepEqual(other.recovered_reads, [], 'different calendar does not recover the original');
-  assert.deepEqual(other.warnings.map(x => x.id), ['read-2']);
+  assert.equal(other.ok, false, 'the unrecovered calendar read is fatal');
+  assert.deepEqual(other.warnings, []);
   f.report.coverage.calendar.receipt_ids = ['read-2'];
   assert.equal(verify(f.events, f.report).ok, false, 'citing the unrecovered read is fatal');
   const g = fixture(); resultOf(g.events, '__search_threads').content = 'Service failure';
   appendRead(g, 'search_threads', { query: 'different scheduling query', pageSize: 10 }, { threads: [] });
   const query = verify(g.events, g.report);
   assert.deepEqual(query.recovered_reads, [], 'different query cannot recover');
-  assert.deepEqual(query.warnings.map(x => x.id), ['read-0']);
+  assert.equal(query.ok, false, 'the unrecovered search is fatal');
+  assert.ok(query.errors.includes(`Gmail search response shape is unrecognized: ${names.search_threads}`), query.errors.join('\n'));
   g.report.episodes[0].facts[0].evidence.push('read-0');
   assert.equal(verify(g.events, g.report).ok, false, 'citing the unrecovered read is fatal');
 });
@@ -396,39 +406,138 @@ test('the live three-level Slack envelope (array, text block, JSON string) verif
   block.content = JSON.stringify([{ type: 'text', text: JSON.stringify(LIVE_EMPTY_SLACK) }]);
   assert.equal(verify(f.events, f.report).ok, true, 'stringified block array');
 });
+const LIST_DRAFTS = 'mcp__claude_ai_Gmail__list_drafts';
+const GET_DRAFT = 'mcp__claude_ai_Gmail__get_draft';
+const JOB_MARKDOWN = fs.readFileSync(path.join(HERE, '..', 'JOB.md'), 'utf8');
+test('Gmail draft reads are outside the allowlist, refused by the hook and the gate', () => {
+  assert.equal(ALLOWED.includes(LIST_DRAFTS), false);
+  assert.equal(ALLOWED.includes(GET_DRAFT), false);
+  assert.equal(permitted(LIST_DRAFTS, {}), false);
+  assert.equal(permitted(GET_DRAFT, { draftId: 'draft-fictional' }), false);
+  for (const tool of [LIST_DRAFTS, GET_DRAFT]) {
+    const hook = spawnSync(process.execPath, [path.join(HERE, 'gate.mjs')], { input: JSON.stringify({ tool_name: tool, tool_input: {} }), encoding: 'utf8' });
+    assert.equal(JSON.parse(hook.stdout).hookSpecificOutput.permissionDecision, 'deny', tool);
+  }
+});
+// The shape of the 2026-10-20 failures: an unexhaustible drafts listing, cited by tool name in Gmail coverage and a fact.
+function citedDraftListing() {
+  const f = fixture();
+  f.events.splice(-1, 0,
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'draft-list', name: LIST_DRAFTS, input: { pageSize: 20 } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'draft-list', content: JSON.stringify({ drafts: [{ id: 'draft-fictional', messageId: 'draft-message', threadId: 'thread-fictional' }], nextPageToken: 'more-fictional-drafts' }) }] } });
+  f.report.coverage.gmail.receipt_ids.push(LIST_DRAFTS);
+  f.report.episodes[0].facts.push({ text: 'No Sam draft on thread-fictional.', evidence: [LIST_DRAFTS] });
+  return f;
+}
+test('a cited list_drafts read fails the scan as a forbidden tool, not only as ungrounded evidence', () => {
+  const f = citedDraftListing();
+  const verified = verify(f.events, f.report);
+  assert.equal(verified.ok, false);
+  assert.ok(verified.errors.includes(`Forbidden or out-of-scope tool: ${LIST_DRAFTS}`), verified.errors.join('\n'));
+});
+test('the rendered worker prompt forbids draft tools and never asks for a draft read', () => {
+  const prompt = renderWorkerPrompt(JOB_MARKDOWN);
+  assert.ok(prompt.includes('Gmail draft tools are not available in this scan: never call or search for list_drafts or get_draft, and never cite them'), 'explicit prohibition');
+  assert.ok(prompt.includes('n of m messages returned; the remainder may be an unsent Sam draft'));
+  assert.equal(prompt.match(/list_drafts/g).length, 1, 'list_drafts is named only in the prohibition');
+  assert.equal(prompt.match(/get_draft/g).length, 1, 'get_draft is named only in the prohibition');
+  assert.doesNotMatch(prompt, /record that draft as evidence|indicates user ownership|enumerate the drafts folder|remainder are unsent drafts/);
+  const freshRead = renderClaudeMd(JOB_MARKDOWN).split('\n').find(line => line.startsWith('- **Fresh read right before any send**'));
+  assert.ok(freshRead.includes('existing Sam draft'), freshRead);
+  assert.ok(freshRead.includes('the background worker no longer reads drafts'), freshRead);
+  assert.ok(freshRead.includes('never overwritten or sent on his behalf without his OK'), freshRead);
+});
+// CLO-610: a second, uncited call of a tool that also verified once used to pass as a warning.
+test('an uncited failed or unpaginated read beside a verified read of the same tool is fatal', () => {
+  const cases = {
+    'failed Gmail search': ['search_threads', { query: 'fictional reschedule' }, { error: 'Fictional provider failure' }, names.search_threads],
+    'unfollowed nextPageToken': ['search_threads', { query: 'fictional availability' }, { threads: [], nextPageToken: 'fictional-next-page' }, names.search_threads],
+    'failed Greenhouse interviews read': ['search_my_interviews', { job_ids: [5149015004], status: 'scheduled' }, { ok: false, error: 'Fictional timeout' }, names.search_my_interviews],
+  };
+  for (const [kind, [key, input, result, name]] of Object.entries(cases)) {
+    const f = fixture();
+    appendRead(f, key, input, result, 'stray-read');
+    const verified = verify(f.events, f.report);
+    assert.equal(verified.ok, false, kind);
+    assert.ok(verified.errors.some(e => e.endsWith(`: ${name}`)), `${kind}: ${verified.errors.join('\n')}`);
+    assert.deepEqual(verified.warnings, [], kind);
+  }
+});
+test('an unverified read stays a warning only when its source is declared incomplete with notes', () => {
+  const f = fixture();
+  appendRead(f, 'search_my_interviews', { job_ids: [5149015004], status: 'scheduled' }, { ok: false, error: 'Fictional timeout' }, 'stray-read');
+  f.report.coverage.greenhouse = { complete: false, receipt_ids: [], notes: 'Fictional Greenhouse timeout on scheduled interviews.' };
+  const verified = verify(f.events, f.report);
+  assert.equal(verified.ok, true, verified.errors.join('\n'));
+  assert.deepEqual(verified.partial, ['greenhouse']);
+  assert.deepEqual(verified.warnings.map(x => x.id), ['stray-read']);
+  f.report.coverage.greenhouse.notes = '';
+  assert.equal(verify(f.events, f.report).ok, false, 'notes are required');
+});
+test('every roster read is required: applications and candidates as well as job and interviews', () => {
+  for (const suffix of ['__search_my_applications', '__search_my_candidates']) {
+    const f = fixture();
+    f.events = f.events.filter(e => !(e.message?.content ?? []).some(b => (b.type === 'tool_use' && b.name.endsWith(suffix)) || (b.type === 'tool_result' && b.tool_use_id === resultOf(fixture().events, suffix).tool_use_id)));
+    const verified = verify(f.events, f.report);
+    assert.equal(verified.ok, false, suffix);
+    assert.ok(verified.errors.includes(`Missing actual read: ${suffix}`), verified.errors.join('\n'));
+  }
+});
+test('scoped attachment reads verify; an unrecognised attachment answer is not a read', () => {
+  const f = fixture();
+  appendRead(f, 'search_my_attachments', { application_ids: [7000001] }, { data: [], ok: true, read: { complete: true } }, 'attachments');
+  const verified = verify(f.events, f.report);
+  assert.equal(verified.ok, true, verified.errors.join('\n'));
+  assert.ok(verified.reads.some(x => x.id === 'attachments' && x.service === 'greenhouse'));
+  resultOf(f.events, '__search_my_attachments').content = 'Service temporarily unavailable.';
+  assert.equal(verify(f.events, f.report).ok, false);
+  const g = fixture();
+  appendRead(g, 'search_my_attachments', {}, { data: [], ok: true }, 'unscoped-attachments');
+  assert.ok(verify(g.events, g.report).errors.includes(`Forbidden or out-of-scope tool: ${names.search_my_attachments}`));
+});
+test('a denied draft call fails the run cleanly and keeps the last good checkpoint', async t => {
+  const dir = temp(t), good = fixture();
+  await run({ dataDir: dir, claude: fake(t, good.events) });
+  const checkpoint = fs.readFileSync(path.join(dir, 'checkpoint.json'), 'utf8');
+  const f = fixture();
+  f.events.splice(-1, 0,
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'denied-draft', name: LIST_DRAFTS, input: {} }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'denied-draft', is_error: true, content: 'Outside the read-only scheduling pilot scope.' }] } });
+  f.events.at(-1).permission_denials = [{ tool_name: LIST_DRAFTS, tool_use_id: 'denied-draft', tool_input: {} }];
+  const verified = verify(f.events, f.report);
+  assert.equal(verified.ok, false);
+  assert.ok(verified.errors.includes('Claude did not complete cleanly.'), verified.errors.join('\n'));
+  assert.ok(verified.errors.includes(`Forbidden or out-of-scope tool: ${LIST_DRAFTS}`), verified.errors.join('\n'));
+  delete f.events.at(-1).permission_denials;
+  assert.equal(verify(f.events, f.report).ok, false, 'an attempted draft call fails even without a recorded denial');
+  await assert.rejects(run({ dataDir: dir, claude: fake(t, f.events) }), /verification failed/);
+  assert.equal(fs.readFileSync(path.join(dir, 'checkpoint.json'), 'utf8'), checkpoint);
+});
+test('the rendered worker prompt states read scope and that any unverified read fails the scan', () => {
+  const prompt = renderWorkerPrompt(JOB_MARKDOWN);
+  assert.ok(prompt.includes('search_my_candidates only with job_ids=[5149015004] or candidate_ids'), 'candidate scope');
+  assert.ok(prompt.includes('search_my_attachments only with application_ids or candidate_ids'), 'attachment scope');
+  assert.ok(prompt.includes('A read that fails or leaves pages unread fails the whole scan, cited or not, unless its source is marked complete=false with notes.'));
+});
 function threadWithDraft() {
   const f = fixture();
   resultOf(f.events, '__get_thread').content = JSON.stringify({ id: 'thread-fictional', messageCount: 2, messages: [{ id: 'sent-message', textBody: 'Fictional received scheduling message.' }] });
-  appendRead(f, 'list_drafts', { pageSize: 10 }, { drafts: [{ id: 'draft-fictional', messageId: 'draft-message', threadId: 'thread-fictional' }], nextPageToken: null }, 'draft-list');
-  appendRead(f, 'get_draft', { draftId: 'draft-fictional', messageFormat: 'PLAIN_TEXT' }, { id: 'draft-fictional', messageId: 'draft-message', threadId: 'thread-fictional', plaintextBody: 'Existing unsent draft written by Fictional Sam.' }, 'draft-body');
+  f.events.splice(-1, 0,
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'draft-list', name: LIST_DRAFTS, input: { pageSize: 10 } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'draft-list', content: JSON.stringify({ drafts: [{ id: 'draft-fictional', messageId: 'draft-message', threadId: 'thread-fictional' }], nextPageToken: null }) }] } },
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'draft-body', name: GET_DRAFT, input: { draftId: 'draft-fictional', messageFormat: 'PLAIN_TEXT' } }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'draft-body', content: JSON.stringify({ id: 'draft-fictional', messageId: 'draft-message', threadId: 'thread-fictional', plaintextBody: 'Existing unsent draft written by Fictional Sam.' }) }] } });
   return f;
 }
-test('draft reads stay allowed and need no census, while every draft mutation is denied', () => {
+test('an uncited, complete draft read still fails the scan, and every draft mutation is denied', () => {
   const f = threadWithDraft();
   const verified = verify(f.events, f.report);
-  assert.equal(verified.ok, true, verified.errors.join('\n'));
-  assert.deepEqual(verified.warnings, []);
-  assert.equal(permitted(names.list_drafts, {}), true);
-  assert.equal(permitted(names.get_draft, { draftId: 'draft-fictional' }), true);
+  assert.equal(verified.ok, false);
+  for (const tool of [LIST_DRAFTS, GET_DRAFT]) assert.ok(verified.errors.includes(`Forbidden or out-of-scope tool: ${tool}`), verified.errors.join('\n'));
   for (const name of ['create_draft', 'update_draft', 'send_draft', 'delete_draft']) {
     const tool = `mcp__claude_ai_Gmail__${name}`;
     assert.equal(permitted(tool, {}), false);
     assert.ok(DENIED.some(pattern => new RegExp('^' + pattern.split('*').join('.*') + '$').test(tool)));
-  }
-});
-test('a wrong-ID or body-less draft read is a warning when uncited and fatal when cited', () => {
-  for (const kind of ['wrong-draft-id', 'no-body']) {
-    const f = threadWithDraft();
-    const block = f.events.flatMap(e => e.message?.content ?? []).find(b => b.type === 'tool_result' && b.tool_use_id === 'draft-body');
-    const data = JSON.parse(block.content);
-    if (kind === 'wrong-draft-id') data.id = 'unrequested-draft';
-    if (kind === 'no-body') { delete data.plaintextBody; data.snippet = 'Snippet only.'; }
-    block.content = JSON.stringify(data);
-    const verified = verify(f.events, f.report);
-    assert.equal(verified.ok, true, `${kind}: ${verified.errors.join('\n')}`);
-    assert.deepEqual(verified.warnings, [{ id: 'draft-body', name: names.get_draft, reason: 'Gmail draft has no matching full-body receipt' }], kind);
-    f.report.episodes[0].facts[0].evidence.push('draft-body');
-    assert.equal(verify(f.events, f.report).ok, false, kind);
   }
 });
 test('a MINIMAL message read recovers only through a full-body retry of that same message', () => {
@@ -443,25 +552,10 @@ test('a MINIMAL message read recovers only through a full-body retry of that sam
   call.input.messageId = 'different-message'; result.content = JSON.stringify({ id: 'different-message', textBody: 'Unrelated full text.' });
   const unrecovered = verify(f.events, f.report);
   assert.equal(unrecovered.recovered_reads.some(x => x.id === 'minimal-message'), false);
-  assert.deepEqual(unrecovered.warnings, [{ id: 'minimal-message', name: names.get_message, reason: 'Gmail message has no matching full-body receipt' }]);
-  f.report.episodes[0].facts[0].evidence.push('minimal-message');
-  assert.equal(verify(f.events, f.report).ok, false, 'a cited MINIMAL read is fatal');
+  assert.equal(unrecovered.ok, false, 'an unrecovered MINIMAL read is fatal even when uncited');
+  assert.ok(unrecovered.errors.includes(`Gmail message has no matching full-body receipt: ${names.get_message}`), unrecovered.errors.join('\n'));
 });
 
-test('an unread later list_drafts page is a warning unless cited', () => {
-  const f = threadWithDraft();
-  const listing = resultOf(f.events, '__list_drafts');
-  const data = JSON.parse(listing.content); data.nextPageToken = 'remaining-drafts'; listing.content = JSON.stringify(data);
-  const unread = verify(f.events, f.report);
-  assert.equal(unread.ok, true, unread.errors.join('\n'));
-  assert.deepEqual(unread.warnings.map(x => x.id), ['draft-list']);
-  const cited = structuredClone(f.report); cited.coverage.gmail.receipt_ids.push('draft-list');
-  assert.equal(verify(f.events, cited).ok, false);
-  appendRead(f, 'list_drafts', { pageToken: 'remaining-drafts', pageSize: 10 }, { drafts: [], nextPageToken: null }, 'last-draft-page');
-  const read = verify(f.events, cited);
-  assert.equal(read.ok, true, read.errors.join('\n'));
-  assert.deepEqual(read.warnings, []);
-});
 test('the Gmail provider exact empty-object search is a valid zero-result read', () => {
   const f = fixture();
   resultOf(f.events, '__search_threads').content = '{}';
@@ -488,12 +582,13 @@ test('draft rendering preserves global questions and distinguishes resolved epis
 });
 
 const ODD_SLACK = { results: 'Unexpected provider prose about the channel.', pagination_info: 'End of results - No more pages available.\\n' };
-test('an uncited unrecognised Slack read is a warning when a cited Slack read verifies', () => {
+test('an uncited unrecognised Slack read is fatal even when a cited Slack read verifies', () => {
   const f = fixture();
   appendRead(f, 'slack_search_public_and_private', { query: 'fictional reschedule in:field-engineering-hiring' }, ODD_SLACK, 'slack-odd');
   const verified = verify(f.events, f.report);
-  assert.equal(verified.ok, true, verified.errors.join('\n'));
-  assert.deepEqual(verified.warnings, [{ id: 'slack-odd', name: names.slack_search_public_and_private, reason: 'Slack response shape is unrecognized' }]);
+  assert.equal(verified.ok, false);
+  assert.ok(verified.errors.includes(`Slack response shape is unrecognized: ${names.slack_search_public_and_private}`), verified.errors.join('\n'));
+  assert.deepEqual(verified.warnings, []);
   assert.deepEqual(verified.report.coverage.slack.receipt_ids, ['read-3']);
   const cited = structuredClone(f.report); cited.coverage.slack.receipt_ids.push('slack-odd');
   const failed = verify(f.events, cited);
@@ -501,6 +596,29 @@ test('an uncited unrecognised Slack read is a warning when a cited Slack read ve
   assert.ok(failed.errors.includes(`Slack response shape is unrecognized: ${names.slack_search_public_and_private}`), failed.errors.join('\n'));
   const evidence = structuredClone(f.report); evidence.episodes[0].facts[0].evidence.push('slack-odd');
   assert.equal(verify(f.events, evidence).ok, false, 'cited as episode evidence');
+});
+test('per-episode quarantine preserves previously open episodes when an episode update fails verification', async t => {
+  const dir = temp(t), first = fixture();
+  await run({ dataDir: dir, claude: fake(t, first.events) });
+  const second = fixture();
+  // Corrupt the previously open episode with an ungrounded fact and add a valid second episode
+  second.report.episodes[0].facts.push({ text: 'Ungrounded fact.', evidence: ['non-existent-receipt'] });
+  second.report.episodes.push({
+    episode_id: 'second-fictional-episode',
+    status: 'open',
+    facts: [{ text: 'Second fictional candidate offered Friday.', evidence: [names.get_thread] }],
+    next_actions: [{ action_key: 'propose-friday-hold', text: 'Review Friday hold.', draft: 'Friday draft.', evidence: [names.get_thread] }],
+    unknowns: [],
+  });
+  second.events.at(-1).result = JSON.stringify(second.report);
+  const outcome = await run({ dataDir: dir, claude: fake(t, second.events) });
+  assert.equal(outcome.success, true);
+  const savedCheckpoint = JSON.parse(fs.readFileSync(path.join(dir, 'checkpoint.json'), 'utf8'));
+  assert.deepEqual(savedCheckpoint.report.episodes.map(e => e.episode_id), ['fictional-episode', 'second-fictional-episode']);
+  assert.ok(savedCheckpoint.report.episodes[0].unknowns.some(u => u.includes('Quarantined invalid episode update')));
+  const savedVerification = JSON.parse(fs.readFileSync(path.join(dir, 'last-verification.json'), 'utf8'));
+  assert.equal(savedVerification.quarantined_episodes.length, 1);
+  assert.equal(savedVerification.quarantined_episodes[0].episode_id, 'fictional-episode');
 });
 test('an unrecognised read that is the only Slack read still fails as a missing actual read', () => {
   const f = fixture();

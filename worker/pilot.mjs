@@ -18,7 +18,7 @@ const REQUIRED_READS = {
   gmail: ['__search_threads'],
   calendar: ['__list_events'],
   slack: ['__slack_search_public_and_private'],
-  greenhouse: ['__get_my_job', '__search_my_interviews'],
+  greenhouse: ['__get_my_job', '__search_my_interviews', '__search_my_applications', '__search_my_candidates'],
 };
 const MINUTE = 60_000;
 export const DENIED = [
@@ -220,6 +220,7 @@ function readProblem(receipt, all = []) {
   if (receipt.name.endsWith('__search_my_interviews') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse interview response shape is unrecognized';
   if (receipt.name.endsWith('__search_my_applications') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse application response shape is unrecognized';
   if (receipt.name.endsWith('__search_my_candidates') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse candidate response shape is unrecognized';
+  if (receipt.name.endsWith('__search_my_attachments') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse attachment response shape is unrecognized';
   if (receipt.name.endsWith('__search_threads') && !Array.isArray(d?.threads ?? d?.data?.threads) &&
     !(d && typeof d === 'object' && !Array.isArray(d) && Object.keys(d).length === 0)) return 'Gmail search response shape is unrecognized';
   if (receipt.name.endsWith('__get_thread') && !fullThread(receipt, all)) return 'Gmail thread lacks full bodies for every message';
@@ -231,7 +232,7 @@ function readProblem(receipt, all = []) {
 }
 function pageInput(input = {}) { return Object.fromEntries(Object.entries(input).filter(([k]) => /cursor|page.?token|^page$|^offset$/i.test(k)).sort(([a], [b]) => a.localeCompare(b))); }
 function firstPage(input) { return Object.entries(pageInput(input)).every(([k, v]) => v === '' || v === null || (/^page$/i.test(k) ? Number(v) === 1 : /^offset$/i.test(k) && Number(v) === 0)); }
-export function verify(events, report) {
+export function verify(events, report, { quarantineEpisodes = false, previousEpisodes = [] } = {}) {
   report = structuredClone(report);
   const calls = new Map();
   const results = new Map();
@@ -239,6 +240,7 @@ export function verify(events, report) {
   const warnings = [];
   const unverified = [];
   const recoveredReads = [];
+  const quarantinedEpisodes = [];
   const final = events.filter(e => e.type === 'result').at(-1);
   if (!final || final.is_error || final.subtype !== 'success' || final.permission_denials?.length) errors.push('Claude did not complete cleanly.');
   for (const event of events) {
@@ -295,36 +297,62 @@ export function verify(events, report) {
   }
   if (partial.length === SERVICES.length) errors.push('Every source is incomplete; nothing was verified.');
   for (const s of SERVICES) if (!partial.includes(s)) for (const suffix of REQUIRED_READS[s]) if (!values.some(x => x.name.endsWith(suffix))) errors.push(`Missing actual read: ${suffix}`);
-  // A receipt that is neither fully read nor recovered is fatal only when the report relies on it.
-  const cited = new Set([
-    ...SERVICES.filter(s => !partial.includes(s)).flatMap(s => Array.isArray(report?.coverage?.[s]?.receipt_ids) ? report.coverage[s].receipt_ids : []),
-    ...(report?.episodes ?? []).flatMap(ep => [...(ep.facts ?? []), ...(ep.next_actions ?? []), ...(ep.resolution ? [ep.resolution] : [])]).flatMap(item => Array.isArray(item?.evidence) ? item.evidence : []),
-  ]);
-  for (const bad of unverified) {
-    if (cited.has(bad.id)) errors.push(`${bad.reason}: ${bad.name}`);
-    else warnings.push(bad);
-  }
   for (const receipt of partial.includes('gmail') ? [] : values.filter(x => x.name.endsWith('__search_threads'))) {
     for (const thread of receipt.data?.threads ?? receipt.data?.data?.threads ?? []) {
       if (!values.some(x => x.name.endsWith('__get_thread') && String(x.input?.threadId ?? x.input?.thread_id ?? x.input?.id) === String(thread.id))) errors.push('A Gmail search result has no successful full-body read.');
     }
   }
   if (!Array.isArray(report?.episodes) || !Array.isArray(report?.unknowns)) errors.push('Invalid report structure.');
+  const priorById = new Map((previousEpisodes ?? []).filter(ep => ep?.episode_id && ep.status !== 'closed').map(ep => [ep.episode_id, ep]));
   const seen = new Set();
+  const validEpisodes = [];
   for (const ep of report?.episodes ?? []) {
-    if (!['open', 'closed'].includes(ep.status) || !ep.episode_id || seen.has(ep.episode_id) || !Array.isArray(ep.facts) || !Array.isArray(ep.next_actions) || !Array.isArray(ep.unknowns)) { errors.push('Invalid or duplicate episode.'); continue; }
-    seen.add(ep.episode_id);
-    if (ep.status === 'closed' && (!ep.resolution || ep.next_actions.length)) errors.push('Closed episode needs current evidence of resolution and no pending actions.');
-    for (const item of [...ep.facts, ...ep.next_actions, ...(ep.resolution ? [ep.resolution] : [])]) {
-      if (typeof item.text !== 'string' || !Array.isArray(item.evidence) || !item.evidence.length || !item.evidence.every(id => receipts.get(id)?.service)) errors.push('Ungrounded episode fact or action.');
+    const epErrors = [];
+    if (!['open', 'closed'].includes(ep?.status) || !ep?.episode_id || seen.has(ep.episode_id) || !Array.isArray(ep.facts) || !Array.isArray(ep.next_actions) || !Array.isArray(ep.unknowns)) {
+      epErrors.push('Invalid or duplicate episode.');
+    } else {
+      seen.add(ep.episode_id);
+      if (ep.status === 'closed' && (!ep.resolution || ep.next_actions.length)) epErrors.push('Closed episode needs current evidence of resolution and no pending actions.');
+      for (const item of [...ep.facts, ...ep.next_actions, ...(ep.resolution ? [ep.resolution] : [])]) {
+        if (typeof item.text !== 'string' || !Array.isArray(item.evidence) || !item.evidence.length || !item.evidence.every(id => receipts.get(id)?.service)) epErrors.push('Ungrounded episode fact or action.');
+      }
+      const keys = new Set();
+      for (const action of ep.next_actions) {
+        if (typeof action.action_key !== 'string' || !action.action_key || keys.has(action.action_key) || typeof action.draft !== 'string') epErrors.push('Invalid or duplicate next action.');
+        keys.add(action.action_key);
+      }
     }
-    const keys = new Set();
-    for (const action of ep.next_actions) {
-      if (typeof action.action_key !== 'string' || !action.action_key || keys.has(action.action_key) || typeof action.draft !== 'string') errors.push('Invalid or duplicate next action.');
-      keys.add(action.action_key);
+    if (epErrors.length === 0) {
+      validEpisodes.push(ep);
+    } else if (quarantineEpisodes) {
+      const dedupedEpErrors = [...new Set(epErrors)];
+      quarantinedEpisodes.push({ episode_id: ep?.episode_id ?? null, errors: dedupedEpErrors });
+      const priorEp = ep?.episode_id ? priorById.get(ep.episode_id) : null;
+      if (priorEp && !validEpisodes.some(x => x.episode_id === priorEp.episode_id)) {
+        const preserved = structuredClone(priorEp);
+        preserved.unknowns = [...(Array.isArray(preserved.unknowns) ? preserved.unknowns : []), `Quarantined invalid episode update (${dedupedEpErrors.join(' ')}); preserved previous open episode.`];
+        validEpisodes.push(preserved);
+      } else if (Array.isArray(report?.unknowns)) {
+        report.unknowns.push(`Quarantined invalid episode ${ep?.episode_id ?? 'unknown'}: ${dedupedEpErrors.join(' ')}`);
+      }
+    } else {
+      errors.push(...epErrors);
     }
   }
-  return { report, ok: errors.length === 0, errors: [...new Set(errors)], warnings, partial, recovered_reads: recoveredReads, reads: values.filter(x => x.service).map(x => ({ id: x.id, name: x.name, service: x.service })) };
+  if (quarantineEpisodes && Array.isArray(report?.episodes)) {
+    report.episodes = validEpisodes;
+  }
+  // A source read that is neither fully read nor recovered is fatal unless its source is declared incomplete with notes; there it stays a warning unless cited.
+  const cited = new Set([
+    ...SERVICES.filter(s => !partial.includes(s)).flatMap(s => Array.isArray(report?.coverage?.[s]?.receipt_ids) ? report.coverage[s].receipt_ids : []),
+    ...(report?.episodes ?? []).flatMap(ep => [...(ep.facts ?? []), ...(ep.next_actions ?? []), ...(ep.resolution ? [ep.resolution] : [])]).flatMap(item => Array.isArray(item?.evidence) ? item.evidence : []),
+  ]);
+  for (const bad of unverified) {
+    const source = results.get(bad.id)?.service;
+    if (cited.has(bad.id) || (source && !partial.includes(source))) errors.push(`${bad.reason}: ${bad.name}`);
+    else warnings.push(bad);
+  }
+  return { report, ok: errors.length === 0, errors: [...new Set(errors)], warnings, partial, recovered_reads: recoveredReads, quarantined_episodes: quarantinedEpisodes, reads: values.filter(x => x.service).map(x => ({ id: x.id, name: x.name, service: x.service })) };
 }
 function withoutPage(input = {}) { return Object.fromEntries(Object.entries(input).filter(([k]) => !/cursor|page.?token|^page$|^offset$|^page_?size$|^per_?page$|^limit$|^max_?results$/i.test(k)).sort(([a], [b]) => a.localeCompare(b))); }
 export function changes(previous, current) {
@@ -467,10 +495,11 @@ export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, cl
     const result = events.filter(e => e.type === 'result').at(-1);
     let report;
     try { report = result?.structured_output ?? JSON.parse(result?.result ?? ''); } catch { throw new Error('Claude did not return the expected JSON report.'); }
-    const verification = verify(events, report);
-    const missing = (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed' && !report.episodes?.some(x => x.episode_id === ep.episode_id));
-    if (missing.length) { verification.ok = false; verification.errors.push('Previously open episodes were omitted; last good checkpoint retained.'); }
+    const previousOpenEpisodes = (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed');
+    const verification = verify(events, report, { quarantineEpisodes: true, previousEpisodes: previousOpenEpisodes });
     report = verification.report;
+    const missing = previousOpenEpisodes.filter(ep => !report.episodes?.some(x => x.episode_id === ep.episode_id));
+    if (missing.length) { verification.ok = false; verification.errors.push('Previously open episodes were omitted; last good checkpoint retained.'); }
     if (verification.ok) {
       for (const ep of report.episodes ?? []) {
         ep.next_actions = (ep.next_actions ?? []).filter(a => !isActionDischarged(ledger, ep.episode_id, a.action_key));

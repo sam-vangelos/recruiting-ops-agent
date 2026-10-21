@@ -1,10 +1,8 @@
-# Interview scheduling: the workflow, codified
+# Deterministic Calendar-Hold State Machine (`planner/` spec)
 
-The agent's job is now defined step by step in [`JOB.md`](JOB.md), from Sam's outline of 2026-10-16. This file describes the hand-built flow of 2026-10-08 and the code in `src/` that implements it; both are rebuilt to match `JOB.md`, and where they disagree, `JOB.md` wins.
+> **Architecture note:** The live 10-step Greenhouse-first operating workflow is defined in [`../JOB.md`](../JOB.md). This document specifies the v1 4-step calendar-hold state machine and the pure TypeScript modules in [`src/`](src/) that implement slot intersection, IANA time-zone math, template rendering, and the pre-dispatch message guard.
 
-Sam ruled this flow on 2026-10-08 while scheduling two field-engineering candidates with Andrew Ma by hand, and the rule in `CLAUDE.md` already names it: hold on the hiring manager's calendar from Sam's calendar, the hiring manager accepts, then the confirming invite goes to the candidate. This file is the spec the scheduling resident implements. The code in `src/` is the executable half; the templates in `templates/` are the voice. Anything here that contradicts `CLAUDE.md` is a bug in this file.
-
-Everything runs as Sam: his calendar holds the events, his Gmail sends the mail, and Greenhouse records the interview under his name with an "assistant acted" note. There is no agent mailbox and no agent calendar.
+Everything runs under Sam's identity: his calendar holds the events, his Gmail sends the mail, and Greenhouse records the interview under his name with an "assistant acted" note. There is no separate agent mailbox or agent calendar.
 
 ## The four steps
 
@@ -13,7 +11,7 @@ A booking moves through four steps in a fixed order. The interviewer's acceptanc
 1. **Find the slot.** Read the interviewer's free/busy from Sam's account (Turing colleagues share free/busy across the domain) and intersect it with the candidate's stated windows, the interview length from the job's plan, the interviewer's interview hours, and a buffer either side. Free/busy cannot see private holds, so "free" is probable, never certain, and the calendar is read again immediately before the event is written.
 2. **Hold it.** Create the event on Sam's primary calendar with a Google Meet, the interviewer as the only attendee, and a client-chosen event id. Title: `Virtual Interview with <Candidate full name> for the role of <Job name>`. Description: the `interviewer-invite` template, which is the text of Greenhouse template "Interview Invitation - Interview Team *New*" (id 4151796004) with the interview-kit link and a line saying the candidate is holding the slot. In the same step, reply in the candidate's own thread with `candidate-hold-placed`: the time in the candidate's zone, "the invite follows once the interviewer confirms", no menu of alternatives.
 3. **Wait for acceptance.** Poll the event's attendee `responseStatus`. `accepted` moves to step 4. `declined` triggers the reschedule branch below. `needsAction` after four working hours sends the interviewer a Slack nudge; by the end of the next working day the recruiter is asked to step in. The candidate is not contacted during the wait.
-4. **Confirm the candidate.** Patch the same event to add the candidate as an attendee (so the Meet link and the calendar invite reach them) and send `candidate-confirmation` in their thread: the Greenhouse "Virtual Interview Confirmation *New*" (id 4151798004) text with Google Meet in place of its Zoom instructions. Record the interview in Greenhouse through the connector (CLO-401) against the calendar event, and leave the private "assistant acted" note. The reminder goes the day before.
+4. **Confirm the candidate.** Patch the same event to add the candidate as an attendee (so the Meet link and the calendar invite reach them) and send `candidate-confirmation` in their thread: the Greenhouse "Virtual Interview Confirmation *New*" (id 4151798004) text with Google Meet in place of its Zoom instructions. Record the interview in Greenhouse through the connector against the calendar event, and leave the private "assistant acted" note. The reminder goes the day before.
 
 ## States
 
@@ -59,7 +57,7 @@ Rules every template obeys, enforced by `src/guard.ts` before dispatch:
 - Links may point only to Google Meet, `app4.greenhouse.io`, or a `turing.com` page.
 - Every time in an outgoing message must equal a time the calendar confirmed for this interview. No other candidate's name may appear.
 - One ask per email, and each template's own `max_words` cap (60 to 120 for the short messages; the confirmation, which is Greenhouse's own text, allows 240).
-- The AI disclosure line (CLO-278) is a declared field, `DISCLOSURE_LINE`, in the first candidate message and every candidate signature. Until legal rules on its wording the field is supplied as the blueprint's draft, and the pilot's approval step is what makes that lawful: Sam reads and sends every message.
+- The AI disclosure line is a declared field, `DISCLOSURE_LINE`, in the first candidate message and every candidate signature. During the human-in-the-loop pilot, Sam reviews and approves every outgoing candidate message before dispatch.
 
 ## Time
 
@@ -81,20 +79,20 @@ Each outward step writes an intent to the ledger before dispatch, carrying the k
 | 3 | `GET calendar/v3/calendars/primary/events/{id}` every few minutes | Read `attendees[].responseStatus`. A sync token over the calendar replaces polling once the resident runs on Cloud Scheduler. |
 | 4a | `PATCH calendar/v3/calendars/primary/events/{id}?sendUpdates=all` | Append the candidate to `attendees`. Same event, never a new one. |
 | 4b | `POST gmail/v1/users/me/messages/send` | Body from `candidate-confirmation`, Meet link included. |
-| 4c | greenhouse-mcp `preview_interview_create` then `apply_interview_create` (CLO-401) | Application, job-interview id, interviewers, start and end, external event id. Then `apply_candidate_note_create` with the "assistant acted" note. |
+| 4c | greenhouse-mcp `preview_interview_create` then `apply_interview_create` | Application, job-interview id, interviewers, start and end, external event id. Then `apply_candidate_note_create` with the "assistant acted" note. |
 
-Greenhouse writes never go direct to Harvest from this resident; a write the connector lacks is added to the connector first.
+Greenhouse writes never go direct to Harvest from this package; any required write goes through the scoped MCP connector.
 
 ## The pilot gate
 
-For the first two weeks on the pilot req, nothing dispatches by itself. The planner produces the exact payloads; the dispatcher writes a Gmail draft (for mail) or posts a Slack card (for calendar and Greenhouse writes), and Sam's send or tick is the dispatch. Each action type (hold, candidate hold reply, confirmation, alternative times, reminder) earns autonomy on its own clean record, in line with the "rejections earn autonomy" ruling. A global pause switch and a per-job switch sit in front of the dispatcher, and a daily cap of 20 outward messages bounds a bad hour.
+For the initial pilot on the scoped requisition, nothing dispatches automatically. The planner produces the exact payloads; the dispatcher stages a draft or approval card, and Sam's approval triggers dispatch. Each action type (hold, candidate hold reply, confirmation, alternative times, reminder) earns autonomy on its own clean record, backed by a global pause switch, a per-job switch, and a daily cap of 20 outward messages.
 
 ## What the code in `src/` does and does not do
 
 Does: parse the inputs into typed records, find slots, build the exact event and email payloads, render and validate templates, run the guard, advance the state machine, and print a plan as JSON. All of it is pure and tested without network access.
 
-Does not, yet: call Google, Greenhouse, or Slack. Dispatch is wired through the spike's `GoogleApi`, `Ledger`, and `dispatchOnce` once the OAuth consent in CLO-398 exists, and through the greenhouse-mcp connector once CLO-401 is deployed. Until then `plan` is a dry run whose output a person can execute by hand, which is exactly what happened on 2026-10-08.
+Does not: call Google, Greenhouse, or Slack directly. `plan` is a pure, deterministic planner whose output is inspected or executed by the outer harness.
 
-## Worked example: the two holds of 2026-10-08
+## Worked example
 
-a candidate, Field Engineer, AI Labs (job 5149015004, application APPLICATION_ID), Manager/Tech Screen kit 14297351004. Andrew Ma's free/busy showed Friday 9 October 13:30 to 14:00 Pacific open; the candidate had said Friday 1 to 5 pm Eastern. Hold placed on Sam's calendar with Meet, Andrew invited, description from `interviewer-invite` with kit link `https://app4.greenhouse.io/guides/14297351004/people/CANDIDATE_ID?application_id=APPLICATION_ID`. the candidate's thread got the hold reply naming "Friday, October 9 at 4:30 pm Eastern Time". State: `held`, waiting on Andrew's acceptance. A second candidate's hold followed the same path for Monday 12 October 11:30 to 12:00 Pacific, with the reply still a draft at the time of writing.
+Candidate Priya Ramos, Field Engineer, AI Labs (job 5149015004, application `APPLICATION_ID`), Manager/Tech Screen kit `14297351004`. Dana Okafor's free/busy showed Friday 9 October 13:30 to 14:00 Pacific open; the candidate had offered Friday 1 to 5 pm Eastern. Hold placed on Sam's calendar with Meet, Dana invited, description from `interviewer-invite` with kit link `https://app4.greenhouse.io/guides/14297351004/people/CANDIDATE_ID?application_id=APPLICATION_ID`. The candidate's thread received the hold reply naming "Friday, October 9 at 4:30 pm Eastern Time". State: `held`, waiting on Dana's acceptance.

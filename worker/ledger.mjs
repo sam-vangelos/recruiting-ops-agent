@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,7 +7,39 @@ import { pathToFileURL } from 'node:url';
 
 export const DEFAULT_DATA_DIR = path.join(os.homedir(), '.recruiting-agents/scheduling-pilot');
 export const LEDGER_FILE = 'ledger.jsonl';
-export const LEDGER_KINDS = ['action', 'approval', 'wait', 'note'];
+export const LEDGER_KINDS = ['action', 'approval', 'wait', 'note', 'handoff'];
+export const TERMINAL_SUCCESS_STATUSES = ['dispatched', 'succeeded', 'reconciled'];
+export const EXCEPTIONS = [
+  'step1_stage_move',
+  'step6_interviewer_role',
+  'step7_interviewer_chase_12h',
+  'step7_interviewer_chase_24h',
+  'step8_standard_confirmation',
+  'step8_confirmation_email',
+  'step9_urgent_cancellation',
+  'step10_live_nudge',
+  'step10_scorecard_chase_24h',
+  '12h_rsvp_chase',
+  '24h_rsvp_chase',
+  '24h_scorecard_chase',
+  'calendar_hold',
+  'day_before_reminder',
+  'pre_interview_check',
+  '24h_avail_nudge',
+  'urgent_cancel_rebook',
+  'call_waiting_nudge',
+];
+
+export function sha256(value) {
+  return crypto.createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex');
+}
+const STATUS_RANK = {
+  intent: 1,
+  failed: 2,
+  dispatched: 3,
+  succeeded: 3,
+  reconciled: 4,
+};
 
 export function ledgerPath(target = DEFAULT_DATA_DIR) {
   const resolved = path.resolve(target);
@@ -47,12 +80,12 @@ export function validateRecord(input) {
     }
     base.actor ??= 'sam';
     base.status ??= base.provider_id ? 'dispatched' : 'intent';
-    if (!['intent', 'dispatched', 'failed'].includes(base.status)) {
+    if (!['intent', 'dispatched', 'succeeded', 'reconciled', 'failed'].includes(base.status)) {
       throw new Error(`Invalid action status: ${JSON.stringify(base.status)}.`);
     }
     base.provider_id ??= null;
-    if (base.status === 'dispatched' && (typeof base.provider_id !== 'string' || !base.provider_id.trim())) {
-      throw new Error('dispatched action record requires a non-empty string provider_id.');
+    if ((base.status === 'dispatched' || base.status === 'succeeded') && (typeof base.provider_id !== 'string' || !base.provider_id.trim())) {
+      throw new Error(`${base.status} action record requires a non-empty string provider_id.`);
     }
     return base;
   }
@@ -85,10 +118,12 @@ export function validateRecord(input) {
     return base;
   }
 
-  if (kind === 'note') {
-    if (typeof base.text !== 'string' || !base.text.trim()) {
-      throw new Error('note record requires non-empty text.');
+  if (kind === 'note' || kind === 'handoff') {
+    const text = base.text ?? base.reason ?? base.summary;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error(`${kind} record requires non-empty text.`);
     }
+    base.text = text;
     return base;
   }
 
@@ -110,7 +145,7 @@ export function append(target, record) {
   return normalized;
 }
 
-export function read(target = DEFAULT_DATA_DIR) {
+export function read(target = DEFAULT_DATA_DIR, { tolerant = false } = {}) {
   const file = ledgerPath(target);
   let content;
   try {
@@ -127,9 +162,15 @@ export function read(target = DEFAULT_DATA_DIR) {
     try {
       parsed = JSON.parse(line);
     } catch (e) {
+      if (tolerant) continue;
       throw new Error(`Malformed JSON in ${file} at line ${index + 1}: ${e.message}`);
     }
-    records.push(validateRecord(parsed));
+    try {
+      records.push(validateRecord(parsed));
+    } catch (e) {
+      if (tolerant) continue;
+      throw e;
+    }
   }
   return records;
 }
@@ -140,7 +181,20 @@ export function dedupe(recordsOrTarget = DEFAULT_DATA_DIR) {
   for (const raw of records) {
     const record = validateRecord(raw);
     const prior = byKey.get(record.idempotency_key);
-    byKey.set(record.idempotency_key, prior ? { ...prior, ...record } : record);
+    if (!prior) {
+      byKey.set(record.idempotency_key, record);
+      continue;
+    }
+    const merged = { ...prior, ...record };
+    if (prior.kind === 'action' && record.kind === 'action') {
+      const priorRank = STATUS_RANK[prior.status] ?? 0;
+      const nextRank = STATUS_RANK[record.status] ?? 0;
+      if (priorRank > nextRank) {
+        merged.status = prior.status;
+        if (prior.provider_id) merged.provider_id = prior.provider_id;
+      }
+    }
+    byKey.set(record.idempotency_key, merged);
   }
   return [...byKey.values()];
 }
@@ -158,30 +212,61 @@ function keyVariants(episodeId, actionKey) {
   return keys;
 }
 
+export function dischargedKeys(recordsOrTarget = DEFAULT_DATA_DIR) {
+  const entries = dedupe(recordsOrTarget);
+  const discharged = new Set();
+  for (const entry of entries) {
+    if (entry.kind === 'action' && TERMINAL_SUCCESS_STATUSES.includes(entry.status)) {
+      for (const k of keyVariants(entry.episode_id, entry.action_key)) discharged.add(k);
+    }
+  }
+  return [...discharged];
+}
+
 export function summarizeLedger(recordsOrTarget = DEFAULT_DATA_DIR) {
   const entries = dedupe(recordsOrTarget);
   const discharged = new Set();
   const declined = new Set();
   const approved = new Set();
+  const unresolvedKeys = new Set();
+  const pendingIntents = [];
   const activeWaits = [];
   const notes = [];
 
   for (const entry of entries) {
-    if (entry.kind === 'action' && entry.status !== 'failed') {
-      for (const k of keyVariants(entry.episode_id, entry.action_key)) discharged.add(k);
+    if (entry.kind === 'action') {
+      if (TERMINAL_SUCCESS_STATUSES.includes(entry.status)) {
+        for (const k of keyVariants(entry.episode_id, entry.action_key)) discharged.add(k);
+      } else if (entry.status === 'intent') {
+        pendingIntents.push(entry);
+      }
     } else if (entry.kind === 'approval') {
       const targetSet = entry.decision === 'declined' ? declined : approved;
       for (const k of keyVariants(entry.episode_id, entry.action_key)) targetSet.add(k);
     } else if (entry.kind === 'wait' && !entry.resolved_at) {
       activeWaits.push(entry);
-    } else if (entry.kind === 'note') {
+    } else if (entry.kind === 'note' || entry.kind === 'handoff') {
       notes.push(entry);
+    }
+  }
+
+  const unresolvedIntents = [];
+  for (const intent of pendingIntents) {
+    const variants = keyVariants(intent.episode_id, intent.action_key);
+    if (!variants.some(k => discharged.has(k))) {
+      for (const k of variants) unresolvedKeys.add(k);
+      unresolvedIntents.push({
+        ...intent,
+        reconciliation_status: 'unresolved_intent',
+      });
     }
   }
 
   return {
     entries,
     discharged_action_keys: [...discharged],
+    unresolved_action_keys: [...unresolvedKeys],
+    unresolved_intents: unresolvedIntents,
     declined_action_keys: [...declined],
     approved_action_keys: [...approved],
     active_waits: activeWaits,
@@ -197,6 +282,8 @@ export function isActionDischarged(summary, episodeId, actionKey) {
   ]);
   return keyVariants(episodeId, actionKey).some(k => suppressed.has(k));
 }
+
+export { append as appendLedger, read as readLedger };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [command, ...args] = process.argv.slice(2);

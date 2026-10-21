@@ -19,6 +19,28 @@ test('gate allowlist includes search_my_applications and search_my_candidates wi
   assert.equal(permitted('mcp__greenhouse-recruiter__search_my_candidates', { job_ids: [999] }), false);
 });
 
+test('candidate and attachment searches never run unscoped, and scope_handle is rejected', () => {
+  const candidates = 'mcp__greenhouse-recruiter__search_my_candidates', attachments = 'mcp__greenhouse-recruiter__search_my_attachments';
+  for (const input of [{}, { query: 'Fictional Person' }, { candidate_ids: [] }, { candidate_ids: '' }, { job_ids: [] }, { job_ids: [5149015004, 999] }, { job_ids: [999], candidate_ids: [101] }]) {
+    assert.equal(permitted(candidates, input), false, JSON.stringify(input));
+  }
+  assert.equal(permitted(candidates, { candidate_ids: '101,102' }), true);
+  assert.equal(permitted(candidates, { job_ids: '5149015004' }), true);
+  assert.ok(ALLOWED.includes(attachments));
+  assert.equal(ALLOWED.includes('mcp__greenhouse-recruiter__search_my_notes'), false);
+  assert.equal(permitted(attachments, { application_ids: [7000001] }), true);
+  assert.equal(permitted(attachments, { candidate_ids: '101' }), true);
+  for (const input of [{}, { job_ids: [5149015004] }, { application_ids: [] }, { candidate_ids: '' }, { application_ids: [''] }]) {
+    assert.equal(permitted(attachments, input), false, JSON.stringify(input));
+  }
+  // CLO-659: scope_handle on any greenhouse-recruiter tool is rejected even if job_ids=[5149015004] is present
+  assert.equal(permitted('mcp__greenhouse-recruiter__search_my_applications', { job_ids: [5149015004], scope_handle: 'scope-other-job' }), false);
+  assert.equal(permitted('mcp__greenhouse-recruiter__search_my_interviews', { job_ids: [5149015004], scope_handle: 'scope-other-job' }), false);
+  assert.equal(permitted(candidates, { job_ids: [5149015004], scope_handle: 'scope-other-job' }), false);
+  assert.equal(permitted(attachments, { application_ids: [7000001], scope_handle: 'scope-other-job' }), false);
+  assert.equal(permitted('mcp__greenhouse-recruiter__get_my_job', { id: 5149015004, scope_handle: 'scope-other-job' }), false);
+});
+
 test('rosterCalendarWindow spans from min(today 00:00 Pacific, now - 24h) through today + 7 days', () => {
   const now = Date.parse('2026-10-16T18:30:00.000Z'); // 2026-10-16 11:30 PDT
   const win = rosterCalendarWindow(now, 'America/Los_Angeles');
@@ -53,7 +75,7 @@ test('classifyCalendarEvent recognises Calendly, Greenhouse-created round, and h
     start: { dateTime: '2026-10-16T19:00:00Z' },
     end: { dateTime: '2026-10-16T19:45:00Z' },
     attendees: [
-      { email: 'khiem.doan@turing.com', responseStatus: 'needsAction' },
+      { email: 'dana.okafor@turing.com', responseStatus: 'needsAction' },
       { email: 'schedule@lily.greenhouse.io', responseStatus: 'accepted' },
     ],
   }, known);
@@ -70,7 +92,7 @@ test('classifyCalendarEvent recognises Calendly, Greenhouse-created round, and h
     start: { dateTime: '2026-10-16T21:00:00Z' },
     end: { dateTime: '2026-10-16T21:45:00Z' },
     attendees: [
-      { email: 'khiem.doan@turing.com', responseStatus: 'accepted' },
+      { email: 'dana.okafor@turing.com', responseStatus: 'accepted' },
       { email: 'handmade.candidate@example.com', displayName: 'Jordan Lee', responseStatus: 'accepted' },
     ],
   }, known);
@@ -206,7 +228,7 @@ test('roster joins on all three keys in order of confidence and surfaces all fiv
         start: { dateTime: '2026-10-16T18:00:00.000Z' },
         end: { dateTime: '2026-10-16T18:45:00.000Z' },
         attendees: [
-          { email: 'khiem.doan@turing.com', responseStatus: 'accepted' },
+          { email: 'dana.okafor@turing.com', responseStatus: 'accepted' },
           { email: 'cand1@example.com', responseStatus: 'accepted' },
           { email: 'schedule@lily.greenhouse.io', responseStatus: 'accepted' },
         ],
@@ -220,7 +242,7 @@ test('roster joins on all three keys in order of confidence and surfaces all fiv
         start: { dateTime: '2026-10-16T19:30:00.000Z' },
         end: { dateTime: '2026-10-16T20:15:00.000Z' },
         attendees: [
-          { email: 'khiem.doan@turing.com', responseStatus: 'needsAction' },
+          { email: 'dana.okafor@turing.com', responseStatus: 'needsAction' },
           { email: 'schedule@lily.greenhouse.io', responseStatus: 'accepted' },
         ],
       },
@@ -233,7 +255,7 @@ test('roster joins on all three keys in order of confidence and surfaces all fiv
         start: { dateTime: '2026-10-16T21:00:00.000Z' },
         end: { dateTime: '2026-10-16T21:45:00.000Z' },
         attendees: [
-          { email: 'khiem.doan@turing.com', responseStatus: 'accepted' },
+          { email: 'dana.okafor@turing.com', responseStatus: 'accepted' },
           { email: 'cand3@example.com', responseStatus: 'accepted' },
         ],
       },
@@ -246,7 +268,7 @@ test('roster joins on all three keys in order of confidence and surfaces all fiv
         start: { dateTime: '2026-10-16T22:00:00.000Z' },
         end: { dateTime: '2026-10-16T22:45:00.000Z' },
         attendees: [
-          { email: 'khiem.doan@turing.com', responseStatus: 'accepted' },
+          { email: 'dana.okafor@turing.com', responseStatus: 'accepted' },
           { email: 'schedule@lily.greenhouse.io', responseStatus: 'accepted' },
         ],
       },

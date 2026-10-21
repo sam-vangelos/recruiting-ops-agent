@@ -1,71 +1,36 @@
-# Independent review of a recruiting scheduling agent, before its next build phase
+# Architecture & Failure-Mode Review Brief
 
-You are reviewing the design, code and plan of an interview-scheduling agent that one recruiter has been running for ten days. Your job is to find what is wrong, what is missing and what would be better, before the next two weeks of building start. You are not building anything and you are not here to reassure anyone. The people who built this have read their own plan many times; what they cannot do is see it fresh.
+This document is the red-team review brief used to evaluate the scheduling agent's two-mode design, idempotency guarantees, and operational failure modes after its first ten days in live pilot operation. Candidate names and emails are always redacted (`[candidate]`) in review bundles.
 
-Everything you need is in the bundle below this prompt: the rule set, the ledger spec, the README, the worker's code and prompt, the roadmap, and the three Linear issues that carry the open design questions. Candidate names and emails are replaced with `[candidate]` on purpose; colleagues' names and the recruiter's own are real.
+## System summary
 
-## The situation in ten lines
+Turing's recruiting team operates without dedicated recruiting coordinators. Sam Vangelos, a senior recruiter, built this agent to automate full-cycle interview coordination across his active requisitions. The agent runs on his Mac under his identity—using his Gmail, Google Calendar, Slack, and Greenhouse accounts via MCP connectors inside Claude Code sessions—without separate service accounts, agent mailboxes, or standalone API keys.
 
-Turing's recruiting team has no coordinator. Sam Vangelos, a senior recruiter, schedules his own interviews and built this agent to take that over. The agent runs on his Mac, as him: his Gmail, his Google Calendar, his Slack and his Greenhouse login, through the connectors available inside Claude Code sessions. There is no API key, no agent mailbox and no service account, by his ruling.
+The architecture consists of two operating modes coordinated through a single append-only JSON Lines ledger (`ledger.jsonl`):
 
-It has two modes that share one append-only ledger. A read-only scanner runs every 30 minutes, reads the four systems and writes draft proposals to local files. Claude Code sessions, started from the repo, do the actual sending with Sam's approval on every candidate or interviewer message, and record each outward step in the ledger as an intent before the send and as dispatched after it. Interviews are booked and confirmed only inside Greenhouse through its web UI, driven by the session through a Chrome extension; the interviewer must accept before the candidate is told the time.
+1. **Ambient Read-Only Scanner (`worker/pilot.mjs`)**: Runs every 30 minutes via `launchd`, sweeps all four systems of record, verifies that every reported fact and source scan is backed by paginated MCP tool-call receipts, and writes draft proposals to local private files (`DRAFTS.md`, `checkpoint.json`).
+2. **Interactive Execution Harness (`CLAUDE.md`)**: Interactive Claude Code sessions booted in this repository read the ledger and roster on startup, present a chronological day-view of interviews, surface unreviewed worker proposals, and execute outward actions with Sam's approval—recording each step in `ledger.jsonl` as `"intent"` before dispatch and `"dispatched"` with its provider ID upon completion.
 
-The job is written as ten steps in `JOB.md`, with Sam's rulings quoted and dated. The worker's prompt and the session's instructions are both generated from that file so they cannot drift. The pilot is one requisition (Field Engineer, Greenhouse job 5149015004), a handful of candidates at a time, one hiring manager and two or three interviewers.
+Every interviewer round is scheduled and confirmed inside Greenhouse, and the interviewer must accept the calendar invite before the candidate is sent confirmation details. The domain rules live in a single specification ([`JOB.md`](../../JOB.md)), from which [`tools/render.mjs`](../../tools/render.mjs) generates both the ambient worker prompt and the interactive session harness so the two modes cannot drift.
 
-## What is settled, and what is about to be built
+## Fixed architectural constraints
 
-These are Sam's rulings. Do not spend words re-arguing them unless you believe one is dangerous, in which case say so once, with the specific harm and what changing it would cost:
+1. **Single human identity**: All reads and writes run as Sam. No separate agent mailboxes, service accounts, or Greenhouse seats.
+2. **Greenhouse as system of record**: Interviewer rounds are scheduled and confirmed through Greenhouse, never via bespoke confirmation emails or unlinked calendar holds.
+3. **Interviewer acceptance gates candidate confirmation**: The interviewer must accept the hold before the candidate receives confirmation.
+4. **Human-in-the-loop by default**: During the pilot, every candidate or interviewer message waits for explicit approval, except for the three operational exceptions defined in [`JOB.md`](../../JOB.md) (Greenhouse stage/access updates and standard confirmation sends, urgent interviewer cancellation notices, and live interview call-waiting nudges).
 
-- Everything runs as Sam. No new identities, mailboxes, keys or Greenhouse users.
-- Interviewer rounds are scheduled and confirmed only in Greenhouse. No hand-built calendar holds, no bespoke confirmation emails.
-- The interviewer accepts before the candidate hears a time.
-- During the pilot every message to a candidate or interviewer waits for Sam's explicit approval, with three exceptions listed in `JOB.md`.
-- The runtime is Claude Code on Sam's Mac for the pilot. Moving to an unattended server is parked (milestone M5).
-- Linear is the record; the repo holds the rules and the code.
+## Review dimensions & failure modes
 
-What is about to be built, in order (the roadmap document in the bundle has the detail):
-
-1. Milestone M2: harden the ledger (CLO-557), make the roster join runnable from both modes (CLO-558), replace the installed scanner with the repo's worker, delete the retired `planner/` code.
-2. Milestone M3: the pre-send checks listed in CLO-453 become code the session runs before any send, and a counter releases a message type from approval after 15 consecutive unedited, incident-free approvals.
-
-Three decisions are still Sam's: the AI disclosure line on candidate email (with legal), where Turing's paid-holiday list lives, and whether his own Calendly recruiter screens come inside the agent's job.
-
-## What to examine
-
-Work through these in order. For each, the question is not "is this reasonable" but "where does this break, and what would a strong team do instead".
-
-1. **The ten steps as a coordinator's job.** Read `JOB.md` as if you were an experienced recruiting coordinator. What does a good coordinator do that these steps never mention? Consider panels and multi-interviewer rounds, reschedules the candidate initiates late, no-shows on either side, time zones and the US/Europe daylight-saving gap in late October, interviewer preparation and kit access, candidate experience between steps, and what happens when the hiring manager changes their mind mid-process.
-
-2. **The two-mode design and the ledger.** The scanner and the sessions coordinate only through `ledger.jsonl` and the four systems of record. Find the races and the disagreements: a session acting while a scan is mid-flight, two sessions open at once, a crash between intent and send, a send that succeeded but was recorded as failed. Gmail has no idempotency key, so the ledger is the only protection against a double send. Is the intent/dispatched model sufficient? What should the ledger record that it does not? CLO-557 already lists eight defects the team found; judge whether that list is complete and whether its fixes are the right ones.
-
-3. **The send path and the meaning of a tick.** A model drafts, Sam approves in chat, the same model sends through a connector. What can still go wrong between approval and send? When does an approval stop being meaningful (stale context, a draft that changed, a thread that moved on)? The pre-send gate in CLO-453 has 14 checks: which are missing, which are theatre, and which would hand too many cases back to Sam to be worth it?
-
-4. **Earned autonomy.** Is "15 consecutive unedited, incident-free approvals per message type" a sound release criterion? What counts as an incident, who detects it, and how is autonomy revoked? What would you require in addition, or instead?
-
-5. **Operational reality.** The Mac sleeps; Google's Context Aware Access blocks the cloud console from it; the Greenhouse connector returned 503s today; each scanner run costs about 1% of the weekly Claude allowance; a Haiku shadow is being scored against Sonnet. What fails first at twice the candidate volume, or with a second recruiter's requisitions? Which of these is the real ceiling on this architecture?
-
-6. **Verification and tests.** The team has already found tests that passed against a neutered implementation. Read the test files in the bundle with that in mind: what do they actually prove, and what evidence should exist before the scanner cutover that does not exist today?
-
-7. **Roadmap sequencing.** Is M2 before M3 the right order? Is anything parked in M5 needed sooner than the plan admits? What would you cut from the next two weeks, and what would you add?
-
-8. **Blind spots.** Name the things this review brief itself did not think to ask about.
-
-## How to write the review
-
-- Cite the bundle: file and line, or section heading. A finding without a citation is an opinion; label it as one.
-- Mark each finding as **verified** (you can point at the code or text that shows it) or **inferred** (a reasonable reading the bundle does not confirm).
-- Rank by consequence. Lead with what would hurt a candidate, an interviewer or Sam's standing if left alone; put style and tidiness last or leave them out.
-- Every finding ends with the concrete change you would make and roughly what it costs (hours, days, or a decision).
-- No praise, no summary of the bundle back to us, no generic best-practice lists. If a point is already in CLO-557 or CLO-453, say "already captured in CLO-557 item 3" and move on, or say why their fix is wrong.
-- Where the bundle does not contain what you need to judge, say exactly what is missing rather than guessing.
-- Hold it to about 2,500 words. Fewer, sharper findings beat a long list.
-
-## Output format
-
-1. **Overall read**: three sentences. Is this on a sound footing, and what is the single biggest risk?
-2. **Findings**, ranked, as a table: number, severity (high / medium / low), area (one of the eight above), the claim in one sentence, the evidence (citation), verified or inferred, the change, the cost.
-3. **The next two weeks, as you would run them**: an ordered list, each item one line, noting where it departs from M2 and M3 and why.
-4. **Questions you would need answered** before committing to the plan.
-5. **What you could not assess** from the bundle.
-
-The bundle follows. Files are delimited by lines beginning `===== `.
+1. **The ten steps as a coordinator's job (`JOB.md`)**:
+   - Multi-interviewer and panel rounds, late candidate-initiated reschedules, no-shows on either side, IANA time zones and the late-October US/Europe daylight-saving transition gap, interviewer kit permissions, and hiring-manager routing changes mid-loop.
+2. **Dual-mode coordination and `ledger.jsonl` (`LEDGER.md`, `worker/ledger.mjs`)**:
+   - Concurrency and race conditions: an interactive session dispatching while a 30-minute background scan is mid-flight, multiple interactive sessions open concurrently, a process crash between writing `"intent"` and completing the provider call, or a provider call that succeeded over the network before returning a timeout. Because Gmail send has no server-side idempotency key, `ledger.jsonl` is the primary guard against duplicate messages.
+3. **The send path and approval freshness (`CLAUDE.md`, `planner/src/guard.ts`)**:
+   - What can change between draft generation, human approval, and connector dispatch (e.g., a candidate replying in the thread or an interviewer's calendar slot filling while a proposal sits awaiting review), requiring a fresh thread and calendar read immediately prior to dispatch plus deterministic pre-send guard checks.
+4. **Earned autonomy criteria**:
+   - Evaluating per-action-type release thresholds (e.g., consecutive unedited, incident-free approvals), defining what constitutes a scheduling incident, and designing automatic circuit-breakers to revoke autonomy on regression.
+5. **Operational ceiling & desktop runtime limits (`worker/pilot.mjs`, `worker/shadow.mjs`)**:
+   - Desktop sleep/wake gaps, upstream MCP connector availability (e.g., transient 503s), weekly subscription token budget (~1% per full 4-service Sonnet sweep), and evaluating smaller models (`claude-haiku-5-5`) via paired shadow runs (`shadow.mjs`) to reduce per-scan cost and latency.
+6. **Verification rigor (`worker/*.test.mjs`, `planner/test/*.test.ts`)**:
+   - Ensuring tests verify real invariants (receipt binding, pagination exhaustion, lock recovery, idempotent deduplication, and timezone-boundary math) against adversarial or partial inputs.

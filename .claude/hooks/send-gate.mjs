@@ -59,9 +59,22 @@ export const TOOLS = [
 export const EXCEPTIONS = {
   step1_stage_move: { kind: 'ask', tools: [/__apply_application_stage_move$/] },
   step6_interviewer_role: { kind: 'ask', tools: [/__apply_[a-z_]*(?:permission|role)[a-z_]*$/] },
-  step8_standard_confirmation: { kind: 'ask', tools: [/__apply_[a-z_]*(?:interview|confirmation)[a-z_]*$/] },
+  step7_interviewer_chase_12h: { kind: 'message', tools: [/__slack_send_message$/] },
+  step7_interviewer_chase_24h: { kind: 'message', tools: [/__slack_send_message$/] },
+  step8_standard_confirmation: { kind: 'ask', tools: [/__apply_[a-z_]*(?:interview|confirmation|candidate_note)[a-z_]*$/, /__(create|update)_event$/] },
+  step8_confirmation_email: { kind: 'message', tools: [/__send_message$/, /__reply$/] },
   step9_urgent_cancellation: { kind: 'message' },
   step10_live_nudge: { kind: 'message' },
+  step10_scorecard_chase_24h: { kind: 'message', tools: [/__slack_send_message$/] },
+  '12h_rsvp_chase': { kind: 'message', tools: [/__slack_send_message$/] },
+  '24h_rsvp_chase': { kind: 'message', tools: [/__slack_send_message$/] },
+  '24h_scorecard_chase': { kind: 'message', tools: [/__slack_send_message$/] },
+  calendar_hold: { kind: 'ask', tools: [/__(create|update|delete)_event$/] },
+  day_before_reminder: { kind: 'message', tools: [/__send_message$/, /__reply$/, /__slack_send_message$/] },
+  pre_interview_check: { kind: 'message', tools: [/__slack_send_message$/] },
+  '24h_avail_nudge': { kind: 'message', tools: [/__send_message$/, /__reply$/] },
+  urgent_cancel_rebook: { kind: 'message' },
+  call_waiting_nudge: { kind: 'message' },
 };
 
 export function classify(toolName) {
@@ -316,7 +329,7 @@ export function findException({ kind, toolName, hash, now = Date.now() }) {
     if (spec.tools && !spec.tools.some(p => p.test(toolName))) continue;
     const at = Date.parse(r.at);
     if (!Number.isFinite(at) || at < now - EXCEPTION_WINDOW_MS || at > now + CLOCK_SKEW_MS) continue;
-    const consumed = records.slice(i + 1).some(d => d?.kind === 'action' && d.status === 'dispatched'
+    const consumed = records.slice(i + 1).some(d => d?.kind === 'action' && ['dispatched', 'succeeded', 'reconciled'].includes(d.status)
       && ((r.action_key && d.action_key === r.action_key) || (r.idempotency_key && d.idempotency_key === r.idempotency_key)));
     if (consumed) continue;
     if (kind === 'message' && r.draft_sha256 !== hash) {
