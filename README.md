@@ -1,6 +1,6 @@
 # recruiting-ops-agent
 
-An autonomous, human-in-the-loop **Recruiting Operations Agent** built by Sam Vangelos at Turing to run full-lifecycle technical recruiting operations and interview coordination across **Greenhouse**, **Google Calendar**, **Gmail**, **Slack**, **Calendly**, and **Granola**.
+An autonomous, human-in-the-loop **Recruiting Operations Agent** to run full-lifecycle technical recruiting operations and interview coordination across **Greenhouse**, **Google Calendar**, **Gmail**, **Slack**, **Calendly**, and **Granola**.
 
 Designed for a recruiting organization operating without dedicated recruiting coordinators, `recruiting-ops-agent` unifies **six core recruiting workflows**—from Calendly candidate intake and Granola screen scorecard submission to hiring-manager Slack signal routing, deliberated candidate rejections, cross-requisition transfers/grooming, and full 10-step interview scheduling—while running entirely under the recruiter's own identity via Model Context Protocol (MCP) connectors and `GreenhouseActionService` (`greenhouse-mcp`).
 
