@@ -161,8 +161,8 @@ export interface ConflictHoldRow<TDetails = Record<string, unknown>> {
   application_id: number;
   stage_id: number;
   scorecard_ids_hash: string;
-  status: 'CONFLICT_HOLD' | 'RESOLVED_ADVANCE' | 'RESOLVED_REJECT';
-  ruling: 'Advance' | 'Reject' | null;
+  status: 'CONFLICT_HOLD' | 'RESOLVED_ADVANCE' | 'RESOLVED_REJECT' | 'RELEASED';
+  ruling: 'Advance' | 'Reject' | 'Hold' | null;
   resolved_at: string | null;
   details: TDetails;
   created_at: string;
@@ -187,17 +187,48 @@ export interface HmSignalRow<TDetails = Record<string, unknown>> {
 export class SqliteCoordinatorStore {
   readonly dbPath: string;
   readonly db: DatabaseSync;
+  private transactionDepth = 0;
 
   constructor(target: string = DEFAULT_DATA_DIR) {
     this.dbPath = sqlitePath(target);
     ensurePrivateDir(path.dirname(this.dbPath));
-    this.db = new DatabaseSync(this.dbPath);
-    try {
-      fs.chmodSync(this.dbPath, 0o600);
-    } catch {
-      // Ignore if in-memory or non-regular file
+    for (const candidatePath of [
+      this.dbPath,
+      `${this.dbPath}-wal`,
+      `${this.dbPath}-shm`,
+    ]) {
+      try {
+        const st = fs.lstatSync(candidatePath);
+        if (st.isSymbolicLink()) {
+          throw new Error(`SQLite file must not be a symbolic link: ${candidatePath}`);
+        }
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') throw err;
+      }
     }
+    this.db = new DatabaseSync(this.dbPath);
     this.initializeSchema();
+    this.hardenSqliteFilePermissions();
+  }
+
+  private hardenSqliteFilePermissions(): void {
+    for (const candidatePath of [
+      this.dbPath,
+      `${this.dbPath}-wal`,
+      `${this.dbPath}-shm`,
+    ]) {
+      try {
+        const st = fs.lstatSync(candidatePath);
+        if (st.isSymbolicLink()) {
+          throw new Error(`SQLite file must not be a symbolic link: ${candidatePath}`);
+        }
+        if (st.isFile()) {
+          fs.chmodSync(candidatePath, 0o600);
+        }
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') throw err;
+      }
+    }
   }
 
   private initializeSchema(): void {
@@ -331,9 +362,14 @@ export class SqliteCoordinatorStore {
 
   /**
    * Executes a synchronous callback inside a `BEGIN IMMEDIATE` transaction (single-writer lock).
+   * Re-entrant: nested calls within an active transaction execute directly inside the outer transaction.
    */
   withImmediateTransaction<T>(fn: () => T): T {
+    if (this.transactionDepth > 0) {
+      return fn();
+    }
     this.db.exec('BEGIN IMMEDIATE');
+    this.transactionDepth++;
     try {
       const result = fn();
       this.db.exec('COMMIT');
@@ -345,6 +381,8 @@ export class SqliteCoordinatorStore {
         // Ignore rollback failure if already rolled back
       }
       throw err;
+    } finally {
+      this.transactionDepth--;
     }
   }
 
@@ -428,6 +466,27 @@ export class SqliteCoordinatorStore {
         .run(lockName, ownerId);
       return Number(res.changes) > 0;
     });
+  }
+
+  getWriterLease(lockName = 'executor'): {
+    lock_name: string;
+    owner_id: string;
+    pid: number;
+    acquired_at: string;
+    expires_at: string;
+  } | null {
+    const row = this.db
+      .prepare('SELECT lock_name, owner_id, pid, acquired_at, expires_at FROM writer_lease WHERE lock_name = ?')
+      .get(lockName) as
+      | {
+          lock_name: string;
+          owner_id: string;
+          pid: number;
+          acquired_at: string;
+          expires_at: string;
+        }
+      | undefined;
+    return row ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -632,6 +691,13 @@ export class SqliteCoordinatorStore {
     return rows.map(r => this.mapChainStepRow(r));
   }
 
+  listUnresolvedIntentSteps(): ChainStepRow[] {
+    const rows = this.db
+      .prepare("SELECT * FROM chain_steps WHERE status = 'intent' ORDER BY created_at ASC, chain_id ASC, step_index ASC")
+      .all() as Record<string, any>[];
+    return rows.map(r => this.mapChainStepRow(r));
+  }
+
   clearPendingChainSteps(chainId: string): number {
     return this.withImmediateTransaction(() => {
       const res = this.db
@@ -691,7 +757,19 @@ export class SqliteCoordinatorStore {
 
     return this.withImmediateTransaction(() => {
       const existing = this.getApproval<TParams, TExpected>(proposalHash);
-      if (existing) return existing;
+      if (existing) {
+        if (existing.decision === 'declined') {
+          this.db
+            .prepare(
+              `UPDATE approvals
+               SET decision = 'pending', approved_at = NULL, executed_at = NULL, failure_reason = NULL, updated_at = ?
+               WHERE proposal_hash = ? AND decision = 'declined'`,
+            )
+            .run(now, proposalHash);
+          return this.getApproval<TParams, TExpected>(proposalHash)!;
+        }
+        return existing;
+      }
 
       this.db
         .prepare(
@@ -740,11 +818,28 @@ export class SqliteCoordinatorStore {
           throw new Error(`Approval parameter mismatch for proposal_hash ${input.proposal_hash}.`);
         }
       }
+      if (existing.decision === input.decision) {
+        return existing;
+      }
+      if (input.decision === 'approved' && existing.decision !== 'pending') {
+        throw new Error(
+          `Cannot transition proposal ${input.proposal_hash} from '${existing.decision}' to 'approved'; only 'pending' proposals can be approved.`,
+        );
+      }
+      if (
+        input.decision === 'declined' &&
+        existing.decision !== 'pending' &&
+        existing.decision !== 'approved'
+      ) {
+        throw new Error(
+          `Cannot transition proposal ${input.proposal_hash} from '${existing.decision}' to 'declined'; proposal is already in terminal state '${existing.decision}'.`,
+        );
+      }
       this.db
         .prepare(
           `UPDATE approvals
            SET decision = ?, actor = ?, approved_at = ?, updated_at = ?
-           WHERE proposal_hash = ?`,
+           WHERE proposal_hash = ? AND decision IN ('pending', 'approved')`,
         )
         .run(
           input.decision,
@@ -754,9 +849,9 @@ export class SqliteCoordinatorStore {
           input.proposal_hash,
         );
 
-      // If a WF3 HM signal proposal is declined by Sam, release any claimed HM signal row
-      // for that episode so a subsequent HM thread reply can re-route the candidate.
-      if (input.decision === 'declined' && existing.workflow === 'wf3_hm_signal') {
+      // If a proposal is declined by Sam, release any claimed WF3 HM signal row
+      // and any WF4 conflict holds / pending deliberation timers for that episode/application+stage.
+      if (input.decision === 'declined') {
         this.db
           .prepare(
             `UPDATE wf3_hm_signals
@@ -764,6 +859,73 @@ export class SqliteCoordinatorStore {
              WHERE episode_id = ? AND status = 'claimed'`,
           )
           .run(now, existing.episode_id);
+
+        const ep = this.getEpisode(existing.episode_id);
+        const paramsObj = (existing.params ?? {}) as Record<string, any>;
+        const expectedObj = (existing.expected_state ?? {}) as Record<string, any>;
+        const appIdRaw =
+          paramsObj.application_id ??
+          expectedObj.application_id ??
+          ep?.application_id ??
+          null;
+        const stageIdRaw =
+          paramsObj.stage_id ??
+          expectedObj.stage_id ??
+          ep?.stage_id ??
+          null;
+
+        if (appIdRaw != null && Number.isFinite(Number(appIdRaw))) {
+          const appId = Number(appIdRaw);
+          if (stageIdRaw != null && Number.isFinite(Number(stageIdRaw))) {
+            this.db
+              .prepare(
+                `UPDATE wf4_conflict_holds
+                 SET status = 'RELEASED', ruling = NULL, resolved_at = ?, updated_at = ?
+                 WHERE application_id = ? AND stage_id = ? AND status IN ('CONFLICT_HOLD', 'RESOLVED_REJECT')`,
+              )
+              .run(now, now, appId, Number(stageIdRaw));
+          } else {
+            this.db
+              .prepare(
+                `UPDATE wf4_conflict_holds
+                 SET status = 'RELEASED', ruling = NULL, resolved_at = ?, updated_at = ?
+                 WHERE application_id = ? AND status IN ('CONFLICT_HOLD', 'RESOLVED_REJECT')`,
+              )
+              .run(now, now, appId);
+          }
+        }
+
+        const remainingActiveRow = this.db
+          .prepare(
+            `SELECT COUNT(*) AS cnt FROM approvals
+             WHERE episode_id = ? AND decision IN ('pending', 'approved')`,
+          )
+          .get(existing.episode_id) as { cnt: number } | undefined;
+        const remainingActive = Number(remainingActiveRow?.cnt ?? 0);
+
+        if (existing.workflow === 'wf4_rejection' || remainingActive === 0) {
+          this.db
+            .prepare(
+              `UPDATE timers
+               SET status = 'cancelled', cancelled_reason = 'proposal_declined', updated_at = ?
+               WHERE episode_id = ? AND status = 'pending'`,
+            )
+            .run(now, existing.episode_id);
+        }
+
+        if (
+          ep &&
+          remainingActive === 0 &&
+          ['PENDING_APPROVAL', 'pending_approval', 'deliberation_holding'].includes(ep.status)
+        ) {
+          this.db
+            .prepare(
+              `UPDATE episodes
+               SET status = 'DECLINED', updated_at = ?
+               WHERE episode_id = ?`,
+            )
+            .run(now, existing.episode_id);
+        }
       }
 
       return this.getApproval<TParams, TExpected>(input.proposal_hash)!;
@@ -837,6 +999,32 @@ export class SqliteCoordinatorStore {
       .prepare("SELECT * FROM approvals WHERE decision = 'approved' ORDER BY approved_at ASC, created_at ASC")
       .all() as Record<string, any>[];
     return rows.map(r => this.mapApprovalRow(r));
+  }
+
+  listApprovals<TParams = Record<string, unknown>, TExpected = Record<string, unknown>>(filter: {
+    decision?: ApprovalDecision | 'all';
+    workflow?: string;
+    episode_id?: string;
+  } = {}): ApprovalRow<TParams, TExpected>[] {
+    const conditions: string[] = [];
+    const params: any[] = [];
+    if (filter.decision !== undefined && filter.decision !== 'all') {
+      conditions.push('decision = ?');
+      params.push(filter.decision);
+    }
+    if (filter.workflow !== undefined) {
+      conditions.push('workflow = ?');
+      params.push(filter.workflow);
+    }
+    if (filter.episode_id !== undefined) {
+      conditions.push('episode_id = ?');
+      params.push(filter.episode_id);
+    }
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(`SELECT * FROM approvals ${whereClause} ORDER BY created_at ASC, proposal_hash ASC`)
+      .all(...params) as Record<string, any>[];
+    return rows.map(r => this.mapApprovalRow<TParams, TExpected>(r));
   }
 
   private mapApprovalRow<TParams = Record<string, unknown>, TExpected = Record<string, unknown>>(
@@ -936,6 +1124,32 @@ export class SqliteCoordinatorStore {
     return rows.map(r => this.mapTimerRow(r));
   }
 
+  listTimers<TPayload = Record<string, unknown>>(filter: {
+    status?: TimerStatus | 'all';
+    episode_id?: string;
+    kind?: string;
+  } = {}): TimerRow<TPayload>[] {
+    const conditions: string[] = [];
+    const params: any[] = [];
+    if (filter.status !== undefined && filter.status !== 'all') {
+      conditions.push('status = ?');
+      params.push(filter.status);
+    }
+    if (filter.episode_id !== undefined) {
+      conditions.push('episode_id = ?');
+      params.push(filter.episode_id);
+    }
+    if (filter.kind !== undefined) {
+      conditions.push('kind = ?');
+      params.push(filter.kind);
+    }
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(`SELECT * FROM timers ${whereClause} ORDER BY fire_at ASC, timer_key ASC`)
+      .all(...params) as Record<string, any>[];
+    return rows.map(r => this.mapTimerRow<TPayload>(r));
+  }
+
   updateTimerStatus(
     timerKey: string,
     status: TimerStatus,
@@ -1014,14 +1228,20 @@ export class SqliteCoordinatorStore {
 
     return this.withImmediateTransaction(() => {
       const existing = this.getConflictHold<TDetails>(holdKey);
-      if (existing) return existing;
+      if (existing && existing.status !== 'RELEASED') return existing;
 
       this.db
         .prepare(
           `INSERT INTO wf4_conflict_holds (
              hold_key, application_id, stage_id, scorecard_ids_hash, status,
              ruling, resolved_at, details_json, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, 'CONFLICT_HOLD', NULL, NULL, ?, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, 'CONFLICT_HOLD', NULL, NULL, ?, ?, ?)
+           ON CONFLICT (hold_key) DO UPDATE SET
+             status = 'CONFLICT_HOLD',
+             ruling = NULL,
+             resolved_at = NULL,
+             details_json = excluded.details_json,
+             updated_at = excluded.updated_at`,
         )
         .run(
           holdKey,
@@ -1029,7 +1249,7 @@ export class SqliteCoordinatorStore {
           input.stage_id,
           scorecardIdsHash,
           JSON.stringify(input.details ?? {}),
-          now,
+          existing?.created_at ?? now,
           now,
         );
       return this.getConflictHold<TDetails>(holdKey)!;
@@ -1038,20 +1258,63 @@ export class SqliteCoordinatorStore {
 
   resolveConflictHold(
     holdKey: string,
-    ruling: 'Advance' | 'Reject',
+    ruling: 'Advance' | 'Reject' | 'Hold',
     now: string = new Date().toISOString(),
   ): ConflictHoldRow | null {
     return this.withImmediateTransaction(() => {
-      const status = ruling === 'Advance' ? 'RESOLVED_ADVANCE' : 'RESOLVED_REJECT';
+      const status =
+        ruling === 'Advance'
+          ? 'RESOLVED_ADVANCE'
+          : ruling === 'Reject'
+            ? 'RESOLVED_REJECT'
+            : 'CONFLICT_HOLD';
+      const resolvedAt = ruling === 'Hold' ? null : now;
       this.db
         .prepare(
           `UPDATE wf4_conflict_holds
            SET status = ?, ruling = ?, resolved_at = ?, updated_at = ?
            WHERE hold_key = ?`,
         )
-        .run(status, ruling, now, now, holdKey);
+        .run(status, ruling, resolvedAt, now, holdKey);
       return this.getConflictHold(holdKey);
     });
+  }
+
+  listConflictHolds<TDetails = Record<string, unknown>>(filter: {
+    application_id?: number;
+    stage_id?: number;
+    status?: string;
+  } = {}): ConflictHoldRow<TDetails>[] {
+    const conditions: string[] = [];
+    const params: any[] = [];
+    if (filter.application_id !== undefined) {
+      conditions.push('application_id = ?');
+      params.push(filter.application_id);
+    }
+    if (filter.stage_id !== undefined) {
+      conditions.push('stage_id = ?');
+      params.push(filter.stage_id);
+    }
+    if (filter.status !== undefined) {
+      conditions.push('status = ?');
+      params.push(filter.status);
+    }
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = this.db
+      .prepare(`SELECT * FROM wf4_conflict_holds ${whereClause} ORDER BY created_at ASC, hold_key ASC`)
+      .all(...params) as Record<string, any>[];
+    return rows.map(row => ({
+      hold_key: row.hold_key,
+      application_id: row.application_id,
+      stage_id: row.stage_id,
+      scorecard_ids_hash: row.scorecard_ids_hash,
+      status: row.status,
+      ruling: row.ruling ?? null,
+      resolved_at: row.resolved_at ?? null,
+      details: JSON.parse(row.details_json),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }));
   }
 
   getConflictHold<TDetails = Record<string, unknown>>(holdKey: string): ConflictHoldRow<TDetails> | null {

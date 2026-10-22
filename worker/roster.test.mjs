@@ -27,7 +27,21 @@ test('candidate and attachment searches never run unscoped, and scope_handle is 
   assert.equal(permitted(candidates, { candidate_ids: '101,102' }), true);
   assert.equal(permitted(candidates, { job_ids: '5149015004' }), true);
   assert.ok(ALLOWED.includes(attachments));
-  assert.equal(ALLOWED.includes('mcp__greenhouse-recruiter__search_my_notes'), false);
+  assert.ok(ALLOWED.includes('mcp__greenhouse-recruiter__search_my_notes'));
+  assert.ok(ALLOWED.includes('mcp__greenhouse-recruiter__search_my_scorecards'));
+  assert.ok(ALLOWED.includes('mcp__greenhouse-recruiter__search_my_interviewers'));
+  assert.equal(ALLOWED.includes('mcp__greenhouse-recruiter__apply_candidate_note_create'), false);
+  for (const scopedRead of [
+    'mcp__greenhouse-recruiter__search_my_notes',
+    'mcp__greenhouse-recruiter__search_my_scorecards',
+    'mcp__greenhouse-recruiter__search_my_interviewers',
+  ]) {
+    assert.equal(permitted(scopedRead, { job_ids: '5149015004' }), true);
+    assert.equal(permitted(scopedRead, { application_ids: [7000001] }), true);
+    assert.equal(permitted(scopedRead, {}), false);
+    assert.equal(permitted(scopedRead, { job_ids: [999] }), false);
+    assert.equal(permitted(scopedRead, { job_ids: [5149015004], scope_handle: 'scope-other-job' }), false);
+  }
   assert.equal(permitted(attachments, { application_ids: [7000001] }), true);
   assert.equal(permitted(attachments, { candidate_ids: '101' }), true);
   for (const input of [{}, { job_ids: [5149015004] }, { application_ids: [] }, { candidate_ids: '' }, { application_ids: [''] }]) {
@@ -327,4 +341,70 @@ test('roster joins on all three keys in order of confidence and surfaces all fiv
       ['cal-email-3', 'accepted', true],
     ],
   );
+});
+
+test('roster merges separate interviewer hold and candidate-only "Interview with Turing" events in either order', () => {
+  const applications = [
+    {
+      id: 7000000010,
+      candidate_id: 9010,
+      status: 'active',
+      current_stage: { id: 40, name: 'Assignment Presentation' },
+      needs_decision: false,
+      last_activity_at: '2026-10-21T20:00:00Z',
+    },
+  ];
+  const candidates = [
+    { id: 9010, first_name: 'Candidate', last_name: 'Ten', email_addresses: [{ value: 'cand10@example.com' }] },
+  ];
+  const interviews = [
+    {
+      id: 8010,
+      application_id: 7000000010,
+      external_event_id: 'cal-interviewer-hold-10',
+      starts_at: '2026-10-23T20:00:00.000Z',
+      ends_at: '2026-10-23T20:30:00.000Z',
+      status: 'scheduled',
+    },
+  ];
+  const interviewerEvent = {
+    id: 'cal-interviewer-hold-10',
+    status: 'confirmed',
+    summary: 'Interview Candidate Ten for Field Engineer, AI Labs - US (Assignment Presentation)',
+    description: 'Guide: https://app4.greenhouse.io/guides/10?application_id=7000000010',
+    start: { dateTime: '2026-10-23T20:00:00.000Z' },
+    end: { dateTime: '2026-10-23T20:30:00.000Z' },
+    attendees: [
+      { email: 'khiem.doan@turing.com', responseStatus: 'accepted' },
+      { email: 'shyam.patel@turing.com', responseStatus: 'accepted' },
+    ],
+  };
+  const candidateOnlyEvent = {
+    id: 'cal-candidate-only-10',
+    status: 'confirmed',
+    summary: 'Interview with Turing',
+    description: 'Join the Google Meet meeting: https://meet.google.com/upd-dsaa-qth',
+    start: { dateTime: '2026-10-23T20:00:00.000Z' },
+    end: { dateTime: '2026-10-23T20:30:00.000Z' },
+    attendees: [{ email: 'cand10@example.com', responseStatus: 'needsAction' }],
+  };
+
+  for (const events of [
+    [interviewerEvent, candidateOnlyEvent],
+    [candidateOnlyEvent, interviewerEvent],
+  ]) {
+    const roster = buildRoster({ applications, interviews, candidates, events });
+    const intRec = roster.candidates[0].interviews[0];
+    assert.equal(intRec.calendar_event_id, 'cal-interviewer-hold-10');
+    assert.equal(intRec.candidate_calendar_event_id, 'cal-candidate-only-10');
+    assert.equal(intRec.matched_by, 'external_event_id');
+    assert.equal(intRec.interviewer_acceptance, 'accepted');
+    assert.equal(intRec.candidate_confirmed, true);
+
+    const dayView = renderDayView(roster, { now: Date.parse('2026-10-23T18:00:00.000Z') });
+    assert.equal(dayView.events.length, 1);
+    assert.equal(dayView.events[0].calendar_event_id, 'cal-interviewer-hold-10');
+    assert.equal(dayView.events[0].interviewer_acceptance, 'accepted');
+    assert.equal(dayView.events[0].candidate_confirmed, true);
+  }
 });

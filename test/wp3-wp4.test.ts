@@ -153,6 +153,23 @@ function createMockProviders() {
       events.set(eventId, ev);
       return ev;
     },
+    async createCandidateEvent(input) {
+      calendarCalls.push({ op: 'createCandidateEvent', input });
+      const eventId = `gcal_cand_${++holdCounter}`;
+      const ev = {
+        event_id: eventId,
+        summary: input.summary,
+        description: input.description,
+        hangout_link: input.googleMeetUrl,
+        html_link: `https://calendar.google.com/event?eid=${eventId}`,
+        status: 'confirmed',
+        start: input.start,
+        end: input.end,
+        attendees: input.attendees,
+      };
+      events.set(eventId, ev);
+      return ev;
+    },
     async patchEvent(input) {
       calendarCalls.push({ op: 'patchEvent', input });
       const existing = events.get(input.event_id) ?? {
@@ -904,6 +921,23 @@ test('WP-4 Chain A (Workflow 6): Steps 7, 8, 9, 10 full lifecycle (RSVP chases, 
       },
     });
     assert.equal(step8Res.ok, true);
+
+    // Verify Step 8 created a SEPARATE candidate-only calendar event and NEVER patched the candidate onto holdEventId
+    const createCandCall = mocks.calendarCalls.find(c => c.op === 'createCandidateEvent');
+    assert.ok(createCandCall, 'Step 8 must create a separate candidate-only calendar event');
+    assert.equal(createCandCall.input.summary, 'Interview with Turing');
+    assert.equal(createCandCall.input.googleMeetUrl, meetLink);
+    assert.equal(createCandCall.input.visibility, 'private');
+    assert.deepEqual(createCandCall.input.attendees, [
+      { email: 'morgan.chen.fictional@example.com', responseStatus: 'needsAction' },
+    ]);
+    const interviewerHoldEv = await mocks.calendar.getEvent!(holdEventId);
+    assert.ok(
+      !interviewerHoldEv?.attendees?.some(
+        a => a.email.toLowerCase() === 'morgan.chen.fictional@example.com',
+      ),
+      'Candidate must never be added to the interviewer calendar event',
+    );
 
     // Verify EMAIL note payload sent to GreenhouseActionService
     const emailNoteCall = mocks.greenhouseCalls.find(

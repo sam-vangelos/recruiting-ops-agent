@@ -76,10 +76,59 @@ Each pairing writes these files under `--out` (default `<shadow-dir>/shadow`):
 
 The shadow must have its own `--shadow-dir`, separate from the live data directory. Each run keeps a lock, a checkpoint and run history in its data directory, and the shadow reconciles against the checkpoint from its own earlier scans. `cycle` and `pair` refuse a shadow directory equal to, inside, or containing the live one, and an `--out` inside the live one. The launchd template `launchd/com.recruiting-agents.scheduling-pilot.shadow-haiku.plist` runs `cycle` at 08:20, 09:50, 11:20, 12:50, 14:20, 15:50, 17:20 and 18:50 local time. Create its data directory before loading it (`node pilot.mjs init --data-dir <shadow-dir>`), because launchd opens the working directory and log files there before the job starts. Each shadow run is a full scan on the same subscription, eight a day on top of the live pilot's own.
 
+## Deterministic Coordinator Executor & Operator Approval CLI
+
+`executor-tick.mjs` drives the SQLite WAL state coordinator (`state.sqlite`) across Workflows 1–6, enforcing the single-writer lease, `<= 120s` pre-dispatch fresh-read gate, in-process send gate, and resumable multi-step chains (Chains A–E).
+
+### Operator CLI Subcommands
+
+```sh
+# Run one 60s deterministic tick (default when no subcommand is given)
+node worker/executor-tick.mjs tick [--data-dir ~/.recruiting-agents/scheduling-pilot] [--dry-run]
+
+# List proposals with 16-hex proposal_hash, episode_id, workflow, action_key, and status
+node worker/executor-tick.mjs list-proposals [--data-dir ~/.recruiting-agents/scheduling-pilot] [--status pending|approved|executed|all]
+
+# Approve a pending proposal (and optionally run a tick immediately)
+node worker/executor-tick.mjs approve <proposal_hash> [--data-dir ~/.recruiting-agents/scheduling-pilot] [--run-now]
+
+# Decline a proposal (releases any claimed wf3_hm_signals lock or wf4_conflict_holds)
+node worker/executor-tick.mjs decline <proposal_hash> [--data-dir ~/.recruiting-agents/scheduling-pilot]
+
+# Resolve a WF1 episode in AWAITING_JOB_MAPPING
+node worker/executor-tick.mjs resolve-job <episode_id> <job_id> [--stage-id <id>] [--data-dir ~/.recruiting-agents/scheduling-pilot]
+
+# Resolve a WF4 mixed-panel scorecard conflict hold (CONFLICT_HOLD)
+node worker/executor-tick.mjs resolve-conflict <application_id> <stage_id> <advance|reject|hold> [--data-dir ~/.recruiting-agents/scheduling-pilot]
+
+# Report active writer lease, episode counts by status, pending approvals, due timers, and unresolved intent steps
+node worker/executor-tick.mjs status [--data-dir ~/.recruiting-agents/scheduling-pilot]
+```
+
+### Frozen Runtime Deployment & LaunchAgent Activation
+
+Deploy the frozen runtime copy (`worker/{pilot.mjs,gate.mjs,ledger.mjs,roster.mjs,prompt.md,shadow.mjs,executor-tick.mjs}` and `src/`) with `0700`/`0600` permissions and symlink rejection:
+
+```sh
+# Deploy runtime to ~/.recruiting-agents/scheduling-pilot/app
+node tools/deploy-runtime.mjs --target-dir ~/.recruiting-agents/scheduling-pilot/app
+
+# Verify no drift or permission mismatch between repo and deployed runtime
+node tools/deploy-runtime.mjs --target-dir ~/.recruiting-agents/scheduling-pilot/app --check
+```
+
+Install and activate the 60-second `executor-tick` LaunchAgent alongside `worker` and `health`:
+
+```sh
+cp launchd/com.recruiting-agents.scheduling-pilot.executor-tick.plist ~/Library/LaunchAgents/
+chmod 600 ~/Library/LaunchAgents/com.recruiting-agents.scheduling-pilot.executor-tick.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.recruiting-agents.scheduling-pilot.executor-tick.plist
+```
+
 ## Verification
 
 ```sh
-node --test worker/pilot.test.mjs worker/shadow.test.mjs worker/ledger.test.mjs
+node tools/render.mjs --check && node --test worker/*.test.mjs .claude/hooks/send-gate.test.mjs test/wp3-wp4.test.ts test/wp5-wp6.test.ts test/chunk4-runtime.test.ts
 ```
 
 Tests use only fictional provider results and a fake Claude executable. They exercise actual run/checkpoint files, allowed/denied hooks, false-success rejection, all-source evidence, nested MCP errors, live empty envelopes, warnings for uncited reads, partial scans, full Gmail content, pagination, preserved pending work, repeated proposals, private permissions, run history, persisted tool-result cleanup, overlap prevention, stale-lock reclaim, blocked runs, the blocking hook mode, stale health, alert recovery, ledger append/read/dedupe, rule-rendering freshness, and discharged-action filtering. The shadow tests pair fictional run directories and run `cycle` against the same kind of fake executable. No live reads, sends, notifications, or schedule installation occur in tests. Successful live scheduled runs and an OS notification witness must be checked separately during activation.

@@ -283,7 +283,7 @@ export function buildRoster({
   }
 
   for (const app of appRows) {
-    if (app?.status && String(app.status).toLowerCase() !== 'active') continue;
+    if (app?.status && !['active', 'in_process'].includes(String(app.status).toLowerCase())) continue;
     const appId = String(app.id ?? app.application_id);
     const cand =
       (app.candidate_id !== undefined && app.candidate_id !== null ? candidateById.get(String(app.candidate_id)) : null) ??
@@ -338,6 +338,7 @@ export function buildRoster({
       starts_at: row.starts_at ?? eventInstant(row.start) ?? null,
       ends_at: row.ends_at ?? eventInstant(row.end) ?? null,
       calendar_event_id: null,
+      candidate_calendar_event_id: null,
       matched_by: null,
       interviewer_acceptance: row.interviewer_acceptance ?? 'unknown',
       candidate_confirmed: Boolean(row.candidate_confirmed),
@@ -399,7 +400,12 @@ export function buildRoster({
     if (!matchedBy && classified.application_id) {
       matchedApp = appMap.get(String(classified.application_id)) ?? null;
       const appInterviews = interviewsByAppId.get(String(classified.application_id)) ?? [];
-      matchedInterview = appInterviews.find(i => !i.calendar_event_id) ?? appInterviews[0] ?? null;
+      const calStartMs = parseMs(classified.starts_at);
+      matchedInterview =
+        appInterviews.find(i => Number.isFinite(calStartMs) && parseMs(i.starts_at) === calStartMs) ??
+        appInterviews.find(i => !i.calendar_event_id) ??
+        appInterviews[0] ??
+        null;
       if (matchedApp || matchedInterview) {
         matchedBy = 'application_id';
       }
@@ -410,7 +416,12 @@ export function buildRoster({
       const appId = emailToAppId.get(classified.candidate_email);
       matchedApp = appMap.get(appId) ?? null;
       const appInterviews = interviewsByAppId.get(appId) ?? [];
-      matchedInterview = appInterviews.find(i => !i.calendar_event_id) ?? appInterviews[0] ?? null;
+      const calStartMs = parseMs(classified.starts_at);
+      matchedInterview =
+        appInterviews.find(i => Number.isFinite(calStartMs) && parseMs(i.starts_at) === calStartMs) ??
+        appInterviews.find(i => !i.calendar_event_id) ??
+        appInterviews[0] ??
+        null;
       matchedBy = 'candidate_email';
     }
 
@@ -428,10 +439,30 @@ export function buildRoster({
     };
 
     if (matchedInterview) {
-      matchedInterview.calendar_event_id = classified.id;
-      matchedInterview.matched_by = matchedBy;
-      matchedInterview.interviewer_acceptance = classified.interviewer_acceptance;
-      matchedInterview.candidate_confirmed = classified.candidate_confirmed;
+      const isCandidateOnlyInvite =
+        classified.kind === 'handmade_candidate' &&
+        (!Array.isArray(classified.interviewer_emails) || classified.interviewer_emails.length === 0);
+
+      if (isCandidateOnlyInvite) {
+        matchedInterview.candidate_calendar_event_id = classified.id;
+        if (!matchedInterview.calendar_event_id) {
+          matchedInterview.calendar_event_id = classified.id;
+          matchedInterview.matched_by = matchedBy;
+        }
+      } else {
+        matchedInterview.calendar_event_id = classified.id;
+        matchedInterview.matched_by = matchedBy;
+      }
+
+      if (
+        classified.interviewer_acceptance !== 'unknown' ||
+        matchedInterview.interviewer_acceptance === 'unknown'
+      ) {
+        matchedInterview.interviewer_acceptance = classified.interviewer_acceptance;
+      }
+      matchedInterview.candidate_confirmed = Boolean(
+        matchedInterview.candidate_confirmed || classified.candidate_confirmed,
+      );
 
       // Check time_mismatch between Greenhouse interview row and Calendar event
       const ghStart = parseMs(matchedInterview.starts_at);
@@ -499,6 +530,26 @@ export function buildRoster({
     }
   }
 
+  // Synchronize merged interviewer_acceptance and candidate_confirmed across paired
+  // interviewer + candidate-only calendar events on the same interview.
+  for (const rec of appMap.values()) {
+    for (const calEntry of rec.calendar_events) {
+      if (!calEntry.interview_id) continue;
+      const intRec = interviewRecordById.get(String(calEntry.interview_id));
+      if (!intRec) continue;
+      calEntry.interviewer_acceptance = intRec.interviewer_acceptance;
+      calEntry.candidate_confirmed = intRec.candidate_confirmed;
+      if (
+        intRec.calendar_event_id &&
+        intRec.candidate_calendar_event_id &&
+        calEntry.id === intRec.candidate_calendar_event_id &&
+        intRec.calendar_event_id !== intRec.candidate_calendar_event_id
+      ) {
+        calEntry.is_secondary_candidate_invite = true;
+      }
+    }
+  }
+
   // Attach Gmail threads per candidate (by application_id or candidate_email)
   for (const t of threadRows) {
     const threadId = String(t.id ?? t.threadId ?? '');
@@ -552,6 +603,7 @@ export function renderDayView(roster, { now = Date.now(), timeZone = 'America/Lo
   const items = [];
   for (const cand of roster?.candidates ?? []) {
     for (const ev of cand.calendar_events ?? []) {
+      if (ev.is_secondary_candidate_invite) continue;
       if (!ev.starts_at) continue;
       if (pacificDateString(ev.starts_at, timeZone) !== targetDate) continue;
       items.push({

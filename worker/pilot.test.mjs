@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { DENIED, verify, changes, run as runPilot, initialize, atomic, takeLock, recoverLock, assess, health, main, markdown } from './pilot.mjs';
+import { DENIED, verify, changes, run as runPilot, initialize, atomic, takeLock, recoverLock, assess, health, main, markdown, parseReportJson, reconcilePreviousOpenEpisodes, sanitizeDraftText, sanitizePreviousEpisodesForContext } from './pilot.mjs';
 import { permitted, ALLOWED } from './gate.mjs';
 import { renderWorkerPrompt, renderClaudeMd } from '../tools/render.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -796,4 +796,323 @@ test('assess reports a blocked run only when it is newer than the last success',
   assert.deepEqual(assess(config, { last_success: new Date(now - 20 * 60_000).toISOString() }, null, now, { blocked: { at } }).reasons, [reason]);
   assert.equal(assess(config, { last_success: new Date(now - 60_000).toISOString() }, null, now, { blocked: { at } }).status, 'healthy');
   assert.ok(assess(config, {}, null, now, { blocked: { at } }).reasons.includes(reason));
+});
+
+test('parseReportJson extracts a valid report when prefixed with summary prose or wrapped in markdown code fences', async t => {
+  const f = fixture();
+  const prosePrefixed = `All four sources were read and reconciled {with zero blockers}. Two fictional episodes updated.\n\n${JSON.stringify(f.report)}`;
+  assert.deepEqual(parseReportJson({ result: prosePrefixed }), f.report);
+  const fenced = `\`\`\`json\n${JSON.stringify(f.report, null, 2)}\n\`\`\``;
+  assert.deepEqual(parseReportJson({ result: fenced }), f.report);
+  assert.throws(() => parseReportJson({ result: 'Completed scan, no JSON object returned.' }), /Claude did not return the expected JSON report/);
+
+  const dir = temp(t);
+  f.events.at(-1).result = prosePrefixed;
+  const outcome = await run({ dataDir: dir, claude: fake(t, f.events) });
+  assert.equal(outcome.success, true);
+});
+
+test('sanitizePreviousEpisodesForContext strips stale draft references and filters stale draft tool names in coverage when no draft tool was called', async t => {
+  const poisonedEpisodes = [
+    {
+      episode_id: 'fictional-ep-1',
+      status: 'open',
+      facts: [
+        {
+          text: "Thread thread-fictional returned 8 of 8 messages. Sam's draft r-9999999999999999999 (dated 10/9) was re-read and holds only an auto-added source note, no reply text. No new reply.",
+          evidence: ['read-1', GET_DRAFT],
+        },
+        {
+          text: 'The Sam-owned draft r8888888888888888888 (thread thread-fictional-2) was re-read via get_draft (MINIMAL). Its snippet shows only the auto-added source note, no reply text. I did not edit it or infer approval from it.',
+          evidence: [GET_DRAFT],
+        },
+      ],
+      next_actions: [
+        {
+          action_key: 'fictional-ep-1:confirm',
+          text: 'A Sam-owned draft (r-9999999999999999999) already sits on his thread, so I will hand the sentence back to Sam.',
+          draft: 'One fictional update.',
+          evidence: ['read-1', GET_DRAFT],
+        },
+      ],
+      unknowns: ['Pending threads were re-checked with get_thread MINIMAL.'],
+    },
+  ];
+  const cleaned = sanitizePreviousEpisodesForContext(poisonedEpisodes);
+  assert.equal(cleaned[0].facts.length, 1, 'draft-only fact is removed');
+  assert.doesNotMatch(cleaned[0].facts[0].text, /r-9999999999999999999|get_draft/);
+  assert.deepEqual(cleaned[0].facts[0].evidence, ['read-1']);
+  assert.doesNotMatch(cleaned[0].next_actions[0].text, /r-9999999999999999999/);
+  assert.deepEqual(cleaned[0].next_actions[0].evidence, ['read-1']);
+  assert.doesNotMatch(cleaned[0].unknowns[0], /get_thread MINIMAL/);
+
+  // Stale tool-name citation in coverage/evidence when no forbidden tool was called in events
+  const f = fixture();
+  f.report.coverage.gmail.receipt_ids.push(GET_DRAFT);
+  f.report.episodes[0].facts[0].evidence.push(GET_DRAFT);
+  const v = verify(f.events, f.report);
+  assert.equal(v.ok, true, v.errors.join('\n'));
+  assert.deepEqual(v.report.coverage.gmail.receipt_ids, ['read-1']);
+  assert.deepEqual(v.report.episodes[0].facts[0].evidence, ['read-1']);
+});
+
+test('uncited metadata-only get_thread header checks on unchanged non-search threads are warnings, while search-result or cited metadata-only threads fail', () => {
+  const f = fixture();
+  // Add an uncited METADATA_ONLY header check on a prior episode thread that was NOT returned by search_threads
+  appendRead(
+    f,
+    'get_thread',
+    { threadId: 'prior-unchanged-thread', format: 'METADATA_ONLY' },
+    { id: 'prior-unchanged-thread', messageCount: 4, messages: [{ id: 'm1', snippet: 'Old message' }] },
+    'prior-header-check',
+  );
+  const verified = verify(f.events, f.report);
+  assert.equal(verified.ok, true, verified.errors.join('\n'));
+  assert.deepEqual(verified.warnings.map(w => w.id), ['prior-header-check']);
+
+  // Citing the metadata-only receipt directly by ID must still fail closed
+  const citedReport = structuredClone(f.report);
+  citedReport.episodes[0].facts[0].evidence.push('prior-header-check');
+  assert.equal(verify(f.events, citedReport).ok, false, 'directly citing a metadata-only receipt is fatal');
+
+  // If the thread WAS returned by search_threads and only read with METADATA_ONLY, it must fail closed
+  const searchReturnedPrior = fixture();
+  resultOf(searchReturnedPrior.events, '__search_threads').content = JSON.stringify({
+    threads: [{ id: 'thread-fictional' }, { id: 'prior-unchanged-thread' }],
+  });
+  appendRead(
+    searchReturnedPrior,
+    'get_thread',
+    { threadId: 'prior-unchanged-thread', format: 'METADATA_ONLY' },
+    { id: 'prior-unchanged-thread', messageCount: 4, messages: [{ id: 'm1', snippet: 'Old message' }] },
+    'prior-header-check',
+  );
+  const failedSearchThread = verify(searchReturnedPrior.events, searchReturnedPrior.report);
+  assert.equal(failedSearchThread.ok, false, 'search result without full body must fail');
+  assert.ok(failedSearchThread.errors.includes('A Gmail search result has no successful full-body read.'));
+
+  // Malformed metadata-only response where a message lacks an id must still fail closed
+  const malformedHeader = fixture();
+  appendRead(
+    malformedHeader,
+    'get_thread',
+    { threadId: 'prior-malformed-thread', format: 'METADATA_ONLY' },
+    { id: 'prior-malformed-thread', messageCount: 1, messages: [{ subject: 'Missing message id' }] },
+    'prior-malformed-check',
+  );
+  assert.equal(verify(malformedHeader.events, malformedHeader.report).ok, false, 'metadata-only message without id must fail');
+});
+
+test('sanitizeDraftText preserves emails, domains, URLs, and quoted periods while stripping draft-read sentences', () => {
+  const emailAndUrlFact =
+    "Fictional Candidate (candidate.one@gmail.com, alumni@berkeley.edu): interviewer.one@turing.com is accepted and schedule@lily.greenhouse.io is needsAction on https://careers.turing.com/job/5149015004. Sam's draft r-9999999999999999999 (dated 10/9) was re-read and holds only an auto-added source note. Candidate replied: 'I can do 12-5pm PST.' She also offered Friday.";
+  const cleaned = sanitizeDraftText(emailAndUrlFact);
+  assert.equal(
+    cleaned,
+    "Fictional Candidate (candidate.one@gmail.com, alumni@berkeley.edu): interviewer.one@turing.com is accepted and schedule@lily.greenhouse.io is needsAction on https://careers.turing.com/job/5149015004. Candidate replied: 'I can do 12-5pm PST.' She also offered Friday.",
+  );
+
+  // Cross-service or unknown mcp__ tool names are not stripped by stripStaleToolNames
+  const f = fixture();
+  f.report.coverage.gmail.receipt_ids.push('mcp__claude_ai_Slack__slack_search_public_and_private');
+  assert.equal(verify(f.events, f.report).ok, false, 'cross-service tool name in gmail coverage must fail');
+  const g = fixture();
+  g.report.episodes[0].facts[0].evidence.push('mcp__claude_ai_Gmail__send_email');
+  assert.equal(verify(g.events, g.report).ok, false, 'disallowed write tool name in evidence must fail');
+});
+
+test('incremental get_thread metadata + get_message on prior episode threads, quiet-scan fallback, and candidate ids batch recovery verify cleanly', () => {
+  const priorEpisodes = [
+    {
+      episode_id: 'gmail:1a00000000000001',
+      status: 'open',
+      facts: [{ text: 'Prior thread 1a00000000000001 had 8 messages read in full.', evidence: [names.get_thread] }],
+      next_actions: [],
+      unknowns: [],
+    },
+  ];
+
+  // 1. Incremental read on a known prior thread returned by search_threads when the latest message has a full-body get_message receipt
+  const inc = fixture();
+  resultOf(inc.events, '__search_threads').content = JSON.stringify({
+    threads: [{ id: 'thread-fictional' }, { id: '1a00000000000001' }],
+  });
+  appendRead(
+    inc,
+    'get_thread',
+    { threadId: '1a00000000000001', format: 'METADATA_ONLY' },
+    {
+      id: '1a00000000000001',
+      messageCount: 2,
+      messages: [
+        { id: 'old-msg-1', snippet: 'Already in previous_episodes' },
+        { id: 'new-msg-2', snippet: 'New candidate reply' },
+      ],
+    },
+    'inc-thread-meta',
+  );
+  appendRead(
+    inc,
+    'get_message',
+    { messageId: 'new-msg-2', format: 'PLAIN_TEXT' },
+    { id: 'new-msg-2', threadId: '1a00000000000001', textBody: 'New candidate availability reply.' },
+    'inc-msg-body',
+  );
+  const vInc = verify(inc.events, inc.report, { previousEpisodes: priorEpisodes });
+  assert.equal(vInc.ok, true, vInc.errors.join('\n'));
+
+  // Without previousEpisodes, the same partial message list must still fail closed
+  assert.equal(verify(inc.events, inc.report, { previousEpisodes: [] }).ok, false);
+
+  // 2. Quiet scan (0 search_threads results, no get_thread call needed) with carried-forward prior episode citing get_thread
+  const quiet = fixture();
+  resultOf(quiet.events, '__search_threads').content = '{}';
+  quiet.events = quiet.events.filter(
+    e => !(e.message?.content ?? []).some(b => (b.type === 'tool_use' && b.name.endsWith('__get_thread')) || (b.type === 'tool_result' && b.tool_use_id === 'read-1')),
+  );
+  quiet.report.coverage.gmail.receipt_ids = [names.search_threads];
+  const vQuiet = verify(quiet.events, quiet.report, { previousEpisodes: priorEpisodes });
+  assert.equal(vQuiet.ok, true, vQuiet.errors.join('\n'));
+  assert.deepEqual(vQuiet.report.episodes[0].facts[0].evidence, ['read-0']);
+
+  // 3. Greenhouse search_my_candidates allows ids scoping and recovers a truncated broad candidate search via a scoped ids batch read
+  assert.equal(permitted(names.search_my_candidates, { ids: '101,102' }), true);
+  assert.equal(permitted(names.search_my_candidates, { job_ids: '5149015004', ids: '101,102' }), true);
+  const candRecovery = fixture();
+  resultOf(candRecovery.events, '__search_my_candidates').content = 'Output too large; persisted to a local file.';
+  appendRead(
+    candRecovery,
+    'search_my_candidates',
+    { job_ids: [5149015004], ids: '101,102' },
+    { data: [{ id: 101 }, { id: 102 }], ok: true, read: { complete: true } },
+    'cand-batch-recovery',
+  );
+  const vCand = verify(candRecovery.events, candRecovery.report);
+  assert.equal(vCand.ok, true, vCand.errors.join('\n'));
+  assert.ok(vCand.recovered_reads.some(r => r.recovered_by === 'cand-batch-recovery'));
+});
+
+test('silent failure mode fixes: nested error flags, compact Slack search, status/statuses pagination, empty Calendar events, episode re-keying, and legacy patch-candidate sanitization', () => {
+  // 1. Nested isError/error inside calendar event or Gmail message objects must not trigger resultFailed
+  const nestedCal = fixture();
+  resultOf(nestedCal.events, '__list_events').content = JSON.stringify({
+    events: [
+      {
+        id: 'evt-nested-1',
+        summary: 'Interview with Turing',
+        conferenceData: { createRequest: { status: { statusCode: 'success', isError: false } } },
+        extendedProperties: { private: { error: 'none', isError: true } },
+      },
+    ],
+  });
+  assert.equal(verify(nestedCal.events, nestedCal.report).ok, true);
+
+  // 2. Empty Calendar window where Google Calendar MCP omits the events array
+  const emptyWindowCal = fixture();
+  resultOf(emptyWindowCal.events, '__list_events').content = JSON.stringify({
+    summary: 'sam.vangelos@turing.com',
+    accessRole: 'owner',
+    timeZone: 'America/Los_Angeles',
+  });
+  assert.equal(verify(emptyWindowCal.events, emptyWindowCal.report).ok, true);
+
+  // 3. Compact numbered Slack search format passes verification
+  const compactSlack = fixture();
+  resultOf(compactSlack.events, '__slack_search_public_and_private').content = JSON.stringify({
+    results:
+      '# Search Results for: in:field-engineering-hiring after:1792540800\n## Messages (1 results)\n1. #field-engineering-hiring (ID: C0C9VEPBAJC) — Sam Vangelos at 2026-10-20 18:19:58 PDT (ts: 1792545598.432779)',
+    pagination_info: 'End of results - No more pages available.',
+  });
+  assert.equal(verify(compactSlack.events, compactSlack.report).ok, true);
+
+  // 4. Multi-page Greenhouse read where page 1 uses status:"active" and page 2 uses statuses:"active"
+  const multiPageGh = fixture();
+  resultOf(multiPageGh.events, '__search_my_applications').content = JSON.stringify({
+    data: [{ id: 1 }],
+    nextCursor: '2',
+    ok: true,
+    read: { complete: true },
+  });
+  appendRead(
+    multiPageGh,
+    'search_my_applications',
+    { statuses: 'active', job_ids: [5149015004], cursor: '2' },
+    { data: [{ id: 2 }], nextCursor: null, ok: true, read: { complete: true } },
+    'gh-apps-page-2',
+  );
+  const vGh = verify(multiPageGh.events, multiPageGh.report);
+  assert.equal(vGh.ok, true, vGh.errors.join('\n'));
+
+  // 5. Scoped search_my_notes, search_my_scorecards, and search_my_interviewers verify cleanly
+  const ghExtras = fixture();
+  appendRead(
+    ghExtras,
+    'search_my_notes',
+    { job_ids: '5149015004', application_ids: [178118966004] },
+    { data: [{ id: 901, body: 'Confirmation sent' }], ok: true, read: { complete: true } },
+    'gh-notes-1',
+  );
+  appendRead(
+    ghExtras,
+    'search_my_scorecards',
+    { job_ids: '5149015004', application_ids: [178118966004] },
+    { data: [{ id: 902, overall_recommendation: 'yes' }], ok: true, read: { complete: true } },
+    'gh-scorecards-1',
+  );
+  appendRead(
+    ghExtras,
+    'search_my_interviewers',
+    { job_ids: '5149015004' },
+    { data: [{ user_id: 4373914004 }], ok: true, read: { complete: true } },
+    'gh-interviewers-1',
+  );
+  assert.equal(verify(ghExtras.events, ghExtras.report).ok, true);
+
+  // 6. Re-keyed or omitted previously open episodes reconcile on non-empty scans, but still fail on empty scans
+  const rekeyScan = fixture();
+  rekeyScan.report.episodes = [
+    {
+      episode_id: '100000000042:screening-round-14297391004',
+      status: 'open',
+      facts: [{ text: 'Priya Ramos (application 100000000042) in thread 0000000000c0ffee.', evidence: [names.get_thread] }],
+      next_actions: [],
+      unknowns: [],
+    },
+  ];
+  const priorOpen = [
+    {
+      episode_id: 'gmail:0000000000c0ffee',
+      status: 'open',
+      facts: [{ text: 'Priya Ramos (application 100000000042) in thread 0000000000c0ffee.', evidence: [names.get_thread] }],
+      next_actions: [],
+      unknowns: [],
+    },
+    {
+      episode_id: 'gmail:stale-prior-thread',
+      status: 'open',
+      facts: [{ text: 'Stale prior thread.', evidence: [names.get_thread] }],
+      next_actions: [],
+      unknowns: [],
+    },
+  ];
+  const reconciled = reconcilePreviousOpenEpisodes(rekeyScan.report, priorOpen);
+  assert.deepEqual(reconciled.missing, []);
+  assert.equal(rekeyScan.report.episodes.length, 2);
+  assert.equal(rekeyScan.report.episodes[0].episode_id, '100000000042:screening-round-14297391004');
+  assert.equal(rekeyScan.report.episodes[1].episode_id, 'gmail:stale-prior-thread');
+  const vRekey = verify(rekeyScan.events, rekeyScan.report, { previousOpenEpisodes: reconciled.missing });
+  assert.equal(vRekey.ok, true, vRekey.errors.join('\n'));
+
+  const emptyScan = fixture();
+  emptyScan.report.episodes = [];
+  const emptyReconciled = reconcilePreviousOpenEpisodes(emptyScan.report, priorOpen);
+  assert.equal(emptyReconciled.missing.length, 2);
+
+  // 7. sanitizeDraftText rewrites legacy "patch <candidate> onto (the )?(calendar )?event" phrasing
+  const legacyPatchText =
+    "Once Sam approves, I'll patch Alex onto event fictionalevent0000000000ab and I'll patch Priya onto the calendar event.";
+  assert.equal(
+    sanitizeDraftText(legacyPatchText),
+    "Once Sam approves, I'll create a separate candidate-only 'Interview with Turing' calendar event and I'll create a separate candidate-only 'Interview with Turing' calendar event.",
+  );
 });

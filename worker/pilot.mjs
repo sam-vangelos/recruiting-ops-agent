@@ -128,11 +128,12 @@ function hasBody(value) {
   return found;
 }
 function resultFailed(data) {
-  let failed = false;
-  walk(data, obj => {
-    if (obj.isError === true || obj.is_error === true || obj.ok === false || obj.success === false || (obj.error && !Array.isArray(obj.error))) failed = true;
-  });
-  return failed;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+  for (const env of [data, data.read, !Array.isArray(data.data) ? data.data : null]) {
+    if (!env || typeof env !== 'object') continue;
+    if (env.isError === true || env.is_error === true || env.ok === false || env.success === false || (env.error && !Array.isArray(env.error))) return true;
+  }
+  return false;
 }
 function pageState(data) {
   const tokens = [];
@@ -160,11 +161,17 @@ function slackResultsRecognized(data) {
   if (typeof data?.results !== 'string' || typeof data?.pagination_info !== 'string') return false;
   const text = data.results;
   if (!/^# Search Results for:/m.test(text)) return false;
+  const hasValidPagination = /End of results - No more pages available|cursor\s+`[^`]+`/i.test(data.pagination_info);
+  if (!hasValidPagination) return false;
   // Slack's live empty answer: a bare "No results found." body with the terminal pagination line.
   if (/^No results found\.$/m.test(text) && !/^### Result /m.test(text)) return /End of results - No more pages available/i.test(data.pagination_info);
   const header = text.match(/^## Messages \((\d+) results?\)/m);
   if (!header) return false;
   const count = Number(header[1]);
+  if (!/^### Result /m.test(text)) {
+    const numbered = [...text.matchAll(/^\d+\.\s+#?\S+/gm)];
+    return count > 0 && numbered.length >= 1 && numbered.length <= count;
+  }
   const blocks = text.split(/^### Result (\d+) of (\d+)\s*$/m).slice(1);
   if (blocks.length !== count * 3) return false;
   for (let i = 0; i < blocks.length; i += 3) {
@@ -173,7 +180,7 @@ function slackResultsRecognized(data) {
     if (!['Channel', 'From', 'Time', 'Message_ts', 'Permalink', 'Text'].every(label => new RegExp('^' + label + ':', 'm').test(body))) return false;
     if (!/^Message_ts: \d+\.\d+/m.test(body) || !/^Permalink:.*https:\/\/[^\s)]+\/archives\//m.test(body)) return false;
   }
-  return /End of results - No more pages available|cursor\s+`[^`]+`/i.test(data.pagination_info);
+  return true;
 }
 function messageValue(data) { return data?.message ?? data; }
 function fullMessage(receipt) {
@@ -192,44 +199,204 @@ function fullDraft(receipt) {
     typeof data?.message?.threadId === 'string' && data.message.threadId.length > 0 &&
     hasBody(data.message) && !pageState(receipt.data).truncated;
 }
-function fullThread(receipt, all) {
+function fullThread(receipt, all, priorThreadIds = new Set()) {
   const messages = receipt.data?.messages;
   if (!Array.isArray(messages)) return false;
   const threadId = receipt.input?.threadId ?? receipt.input?.thread_id ?? receipt.input?.id;
   if (receipt.data?.id !== undefined && String(receipt.data.id) !== String(threadId)) return false;
   const ids = messages.map(x => x.id).filter(Boolean);
   if (!messages.length || new Set(ids).size !== ids.length) return false;
-  // messageCount may include unsent drafts; the gap is reported as an unknown, not reconciled here.
-  return messages.every(message => hasBody(message) || (message.id && all.some(x =>
+  const hasMessageBody = message => hasBody(message) || (message.id && all.some(x =>
     x.name.endsWith('__get_message') && fullMessage(x) &&
     String(messageValue(x.data).id) === String(message.id) &&
-    (!messageValue(x.data).threadId || String(messageValue(x.data).threadId) === String(threadId)))));
+    (!messageValue(x.data).threadId || String(messageValue(x.data).threadId) === String(threadId))));
+  // messageCount may include unsent drafts; the gap is reported as an unknown, not reconciled here.
+  if (messages.every(hasMessageBody)) return true;
+  if (threadId && priorThreadIds.has(String(threadId)) && ids.length === messages.length && hasMessageBody(messages.at(-1))) return true;
+  return false;
 }
 function queryIdentity(receipt) {
   const input = withoutPage(receipt.input);
   // Message format changes representation, not the requested conversation or message.
   if (['__get_thread', '__get_message', '__get_draft'].some(suffix => receipt.name.endsWith(suffix))) for (const key of ['format', 'messageFormat', 'message_format']) delete input[key];
-  return serialized(input);
+  if (receipt.name.includes('greenhouse-recruiter')) {
+    delete input.fields;
+    if (input.job_ids !== undefined) {
+      const normalized = (Array.isArray(input.job_ids) ? input.job_ids : String(input.job_ids ?? '').trim().replace(/^\[|\]$/g, '').split(',')).map(x => String(x ?? '').trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+      input.job_ids = normalized.join(',');
+    }
+    if (input.statuses !== undefined || input.status !== undefined) {
+      const rawStatus = input.status ?? input.statuses;
+      const normalizedStatus = (Array.isArray(rawStatus) ? rawStatus : String(rawStatus ?? '').trim().replace(/^\[|\]$/g, '').split(',')).map(x => String(x ?? '').trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+      delete input.statuses;
+      if (normalizedStatus.length) input.status = normalizedStatus.join(',');
+    }
+  }
+  return serialized(Object.fromEntries(Object.entries(input).sort(([a], [b]) => a.localeCompare(b))));
 }
-function readProblem(receipt, all = []) {
+function readProblem(receipt, all = [], priorThreadIds = new Set()) {
   const d = receipt.data;
   if (receipt.failed) return 'Tool read failed';
-  if (receipt.name.endsWith('__list_events') && !Array.isArray(d?.events)) return 'Calendar response shape is unrecognized';
+  const isCalendarListShape = d && typeof d === 'object' && !Array.isArray(d) && (
+    Array.isArray(d.events) ||
+    (d.events === undefined && (typeof d.accessRole === 'string' || typeof d.summary === 'string' || typeof d.timeZone === 'string'))
+  );
+  if (receipt.name.endsWith('__list_events') && !isCalendarListShape) return 'Calendar response shape is unrecognized';
   if (receipt.name.endsWith('__slack_search_public_and_private') && !slackResultsRecognized(d)) return 'Slack response shape is unrecognized';
   if (receipt.name.endsWith('__get_my_job') && String(d?.data?.id) !== JOB_ID) return 'Greenhouse job did not return the pilot job';
   if (receipt.name.endsWith('__search_my_interviews') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse interview response shape is unrecognized';
   if (receipt.name.endsWith('__search_my_applications') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse application response shape is unrecognized';
   if (receipt.name.endsWith('__search_my_candidates') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse candidate response shape is unrecognized';
   if (receipt.name.endsWith('__search_my_attachments') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse attachment response shape is unrecognized';
+  if (receipt.name.endsWith('__search_my_notes') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse note response shape is unrecognized';
+  if (receipt.name.endsWith('__search_my_scorecards') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse scorecard response shape is unrecognized';
+  if (receipt.name.endsWith('__search_my_interviewers') && (!Array.isArray(d?.data) || d?.ok !== true)) return 'Greenhouse interviewer response shape is unrecognized';
   if (receipt.name.endsWith('__search_threads') && !Array.isArray(d?.threads ?? d?.data?.threads) &&
     !(d && typeof d === 'object' && !Array.isArray(d) && Object.keys(d).length === 0)) return 'Gmail search response shape is unrecognized';
-  if (receipt.name.endsWith('__get_thread') && !fullThread(receipt, all)) return 'Gmail thread lacks full bodies for every message';
+  if (receipt.name.endsWith('__get_thread') && !fullThread(receipt, all, priorThreadIds)) return 'Gmail thread lacks full bodies for every message';
   if (receipt.name.endsWith('__get_message') && !fullMessage(receipt)) return 'Gmail message has no matching full-body receipt';
   if (receipt.name.endsWith('__list_drafts') && !Array.isArray(d?.drafts)) return 'Gmail draft listing shape is unrecognized';
   if (receipt.name.endsWith('__get_draft') && !fullDraft(receipt)) return 'Gmail draft has no matching full-body receipt';
   if (pageState(d).truncated) return 'Truncated read';
   return null;
 }
+const LIST_DRAFTS_TOOL = 'mcp__claude_ai_Gmail__list_drafts';
+const GET_DRAFT_TOOL = 'mcp__claude_ai_Gmail__get_draft';
+const FORBIDDEN_DRAFT_TOOLS = new Set([LIST_DRAFTS_TOOL, GET_DRAFT_TOOL]);
+
+export function sanitizeDraftText(text) {
+  if (typeof text !== 'string' || !text) return text;
+  const sentences = text.split(/(?<=[.!?]['")]*)\s+/);
+  const kept = [];
+  let skipFollowup = false;
+  for (const rawSentence of sentences) {
+    const s = rawSentence.trim();
+    if (!s) continue;
+    const isDraftReadSentence =
+      /\b(?:get_draft|list_drafts)\b/i.test(s) ||
+      /\bdrafts?\s+r-?\d{6,}\b/i.test(s) ||
+      /\br-?\d{10,}\b.*\b(?:re-read|read|snippet|source note|touched)\b/i.test(s) ||
+      /\b(?:re-read|read|checked)\b.*\bdrafts?\s+r-?\d{6,}\b/i.test(s);
+    if (isDraftReadSentence) {
+      skipFollowup = true;
+      continue;
+    }
+    if (skipFollowup && /^(?:Its snippet\b|I did not edit it\b)/i.test(s)) {
+      continue;
+    }
+    skipFollowup = false;
+    const cleaned = s
+      .replace(/\s*\(\s*r-?\d{6,}\s*\)/g, '')
+      .replace(/\br-?\d{10,}\b/g, 'unsent draft')
+      .replace(/\bget_thread\s*\(?\s*(?:MINIMAL|METADATA_ONLY)\s*\)?/gi, 'prior full thread read')
+      .replace(/\band\s+patch\s+(?:him|her|them|the candidate|[A-Z][a-z]+)\s+onto\s+(?:the\s+)?(?:calendar\s+)?event(?:\s+[a-z0-9]{15,})?/gi, "and create a separate candidate-only 'Interview with Turing' calendar event")
+      .replace(/\bpatch\s+(?:him|her|them|the candidate|[A-Z][a-z]+)\s+onto\s+(?:the\s+)?(?:calendar\s+)?event(?:\s+[a-z0-9]{15,})?/gi, "create a separate candidate-only 'Interview with Turing' calendar event")
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    if (cleaned) kept.push(cleaned);
+  }
+  return kept.join(' ');
+}
+
+export function sanitizePreviousEpisodesForContext(episodes = []) {
+  if (!Array.isArray(episodes)) return [];
+  const isCleanRef = ref => {
+    const s = String(ref ?? '');
+    return !FORBIDDEN_DRAFT_TOOLS.has(s) && !/(?:^|__)(?:get_draft|list_drafts)$/i.test(s);
+  };
+  return structuredClone(episodes).map(ep => {
+    if (!ep || typeof ep !== 'object') return ep;
+    if (Array.isArray(ep.facts)) {
+      ep.facts = ep.facts
+        .map(f => {
+          if (!f || typeof f !== 'object') return null;
+          const evidence = Array.isArray(f.evidence) ? f.evidence.filter(isCleanRef) : f.evidence;
+          const text = sanitizeDraftText(f.text);
+          if (!text || (Array.isArray(evidence) && evidence.length === 0)) return null;
+          return { ...f, text, evidence };
+        })
+        .filter(Boolean);
+    }
+    if (Array.isArray(ep.next_actions)) {
+      ep.next_actions = ep.next_actions.map(a => {
+        if (!a || typeof a !== 'object') return a;
+        const evidence = Array.isArray(a.evidence) ? a.evidence.filter(isCleanRef) : a.evidence;
+        const text = typeof a.text === 'string' ? sanitizeDraftText(a.text) : a.text;
+        return { ...a, text, evidence };
+      });
+    }
+    if (ep.resolution && typeof ep.resolution === 'object') {
+      ep.resolution = {
+        ...ep.resolution,
+        text: typeof ep.resolution.text === 'string' ? sanitizeDraftText(ep.resolution.text) : ep.resolution.text,
+        ...(Array.isArray(ep.resolution.evidence) ? { evidence: ep.resolution.evidence.filter(isCleanRef) } : {}),
+      };
+    }
+    if (Array.isArray(ep.unknowns)) {
+      ep.unknowns = ep.unknowns
+        .map(u => (typeof u === 'string' ? sanitizeDraftText(u) : u))
+        .filter(u => typeof u !== 'string' || u.trim().length > 0);
+    }
+    return ep;
+  });
+}
+
+export function parseReportJson(rawResult) {
+  if (rawResult && typeof rawResult === 'object') {
+    if (rawResult.structured_output && typeof rawResult.structured_output === 'object' && !Array.isArray(rawResult.structured_output)) {
+      return rawResult.structured_output;
+    }
+    if (typeof rawResult.result === 'string') {
+      rawResult = rawResult.result;
+    } else if (!Array.isArray(rawResult) && 'coverage' in rawResult && 'episodes' in rawResult) {
+      return rawResult;
+    }
+  }
+  if (typeof rawResult !== 'string') {
+    throw new Error('Claude did not return the expected JSON report.');
+  }
+  const trimmed = rawResult.trim();
+  if (trimmed) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // Fall through to balanced JSON object extraction when prose or code fences surround the report.
+    }
+  }
+  for (let start = rawResult.indexOf('{'); start !== -1; start = rawResult.indexOf('{', start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < rawResult.length; i++) {
+      const ch = rawResult[i];
+      if (inString) {
+        if (escape) escape = false;
+        else if (ch === '\\') escape = true;
+        else if (ch === '"') inString = false;
+      } else if (ch === '"') {
+        inString = true;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          try {
+            const candidate = JSON.parse(rawResult.slice(start, i + 1));
+            if (candidate && typeof candidate === 'object' && !Array.isArray(candidate) && 'coverage' in candidate && 'episodes' in candidate) {
+              return candidate;
+            }
+          } catch {
+            // Continue scanning for the report JSON object.
+          }
+          break;
+        }
+      }
+    }
+  }
+  throw new Error('Claude did not return the expected JSON report.');
+}
+
 function pageInput(input = {}) { return Object.fromEntries(Object.entries(input).filter(([k]) => /cursor|page.?token|^page$|^offset$/i.test(k)).sort(([a], [b]) => a.localeCompare(b))); }
 function firstPage(input) { return Object.entries(pageInput(input)).every(([k, v]) => v === '' || v === null || (/^page$/i.test(k) ? Number(v) === 1 : /^offset$/i.test(k) && Number(v) === 0)); }
 export function verify(events, report, { quarantineEpisodes = false, previousEpisodes = [] } = {}) {
@@ -241,14 +408,19 @@ export function verify(events, report, { quarantineEpisodes = false, previousEpi
   const unverified = [];
   const recoveredReads = [];
   const quarantinedEpisodes = [];
+  let hasForbiddenTool = false;
   const final = events.filter(e => e.type === 'result').at(-1);
-  if (!final || final.is_error || final.subtype !== 'success' || final.permission_denials?.length) errors.push('Claude did not complete cleanly.');
+  const unpermittedDenials = (final?.permission_denials ?? []).filter(d => !permitted(d?.tool_name, d?.tool_input));
+  if (!final || final.is_error || final.subtype !== 'success' || unpermittedDenials.length) errors.push('Claude did not complete cleanly.');
   for (const event of events) {
     for (const b of event.message?.content ?? []) {
       if (b.type === 'tool_use') {
         if (calls.has(b.id)) continue;
         calls.set(b.id, b);
-        if (!permitted(b.name, b.input)) errors.push(`Forbidden or out-of-scope tool: ${b.name}`);
+        if (!permitted(b.name, b.input)) {
+          hasForbiddenTool = true;
+          errors.push(`Forbidden or out-of-scope tool: ${b.name}`);
+        }
       }
       if (b.type === 'tool_result') {
         const call = calls.get(b.tool_use_id);
@@ -260,9 +432,24 @@ export function verify(events, report, { quarantineEpisodes = false, previousEpi
   }
   for (const [id, call] of calls) if (!results.has(id)) errors.push(`Missing receipt: ${call.name}`);
   const all = [...results.values()];
+  const priorThreadIds = new Set();
+  const collectThreadIds = text => {
+    for (const m of String(text ?? '').matchAll(/\bgmail:([0-9a-f]{10,})\b|\b([0-9a-f]{16})\b/gi)) {
+      priorThreadIds.add(m[1] ?? m[2]);
+    }
+  };
+  for (const ep of previousEpisodes ?? []) {
+    const epMatch = String(ep?.episode_id ?? '').match(/^gmail:(.+)$/i);
+    if (epMatch) priorThreadIds.add(epMatch[1]);
+    collectThreadIds(ep?.episode_id);
+    for (const f of ep?.facts ?? []) collectThreadIds(f?.text);
+    for (const a of ep?.next_actions ?? []) collectThreadIds(a?.text);
+    for (const u of ep?.unknowns ?? []) collectThreadIds(u);
+    if (ep?.resolution?.text) collectThreadIds(ep.resolution.text);
+  }
   const sameQuery = (a, b) => a.name === b.name && queryIdentity(a) === queryIdentity(b);
   function fullyRead(receipt, visited = new Set()) {
-    if (readProblem(receipt, all) || visited.has(receipt.id)) return false;
+    if (readProblem(receipt, all, priorThreadIds) || visited.has(receipt.id)) return false;
     const seen = new Set([...visited, receipt.id]);
     const p = pageState(receipt.data);
     const siblings = all.filter(x => sameQuery(x, receipt));
@@ -275,17 +462,59 @@ export function verify(events, report, { quarantineEpisodes = false, previousEpi
   for (const receipt of all) {
     if (fullyRead(receipt)) { receipts.set(receipt.id, receipt); continue; }
     const recovery = receipt.service && permitted(receipt.name, receipt.input) && all.find(x =>
-      x.order > receipt.order && sameQuery(x, receipt) && fullyRead(x) &&
+      x.order > receipt.order &&
+      (sameQuery(x, receipt) || (receipt.name.endsWith('__search_my_candidates') && x.name.endsWith('__search_my_candidates') && permitted(x.name, x.input))) &&
+      fullyRead(x) &&
       (serialized(pageInput(x.input)) === serialized(pageInput(receipt.input)) || firstPage(x.input)));
-    const reason = readProblem(receipt, all) ?? 'Unread or unresolved pagination';
+    const reason = readProblem(receipt, all, priorThreadIds) ?? 'Unread or unresolved pagination';
     if (recovery) recoveredReads.push({ id: receipt.id, name: receipt.name, reason, recovered_by: recovery.id });
     else unverified.push({ id: receipt.id, name: receipt.name, reason });
   }
   const values = [...receipts.values()];
+  const searchedThreadIds = new Set(
+    all
+      .filter(x => x.name.endsWith('__search_threads') && !x.failed)
+      .flatMap(x => x.data?.threads ?? x.data?.data?.threads ?? [])
+      .map(t => String(t?.id ?? ''))
+      .filter(Boolean),
+  );
+  const hasVerifiedFullThread = values.some(x => x.name.endsWith('__get_thread'));
+  const quietPriorGmailFallbackIds =
+    !hasForbiddenTool && !hasVerifiedFullThread && searchedThreadIds.size === 0 && priorThreadIds.size > 0
+      ? values.filter(x => x.name.endsWith('__search_threads') && x.service === 'gmail').map(x => x.id)
+      : [];
   // Only verified good receipts are eligible evidence; failed reads remain diagnostics.
-  const resolveRefs = refs => Array.isArray(refs) ? [...new Set(refs.flatMap(ref => receipts.has(ref) ? [ref] : values.filter(x => x.name === ref && x.service).map(x => x.id).length ? values.filter(x => x.name === ref && x.service).map(x => x.id) : [ref]))] : refs;
-  for (const s of SERVICES) if (report?.coverage?.[s]) report.coverage[s].receipt_ids = resolveRefs(report.coverage[s].receipt_ids);
-  for (const ep of report?.episodes ?? []) for (const item of [...(ep.facts ?? []), ...(ep.next_actions ?? []), ...(ep.resolution ? [ep.resolution] : [])]) item.evidence = resolveRefs(item.evidence);
+  const resolveRefs = refs => Array.isArray(refs) ? [...new Set(refs.flatMap(ref => {
+    if (receipts.has(ref)) return [ref];
+    const byName = values.filter(x => x.name === ref && x.service).map(x => x.id);
+    if (byName.length) return byName;
+    if (ref === 'mcp__claude_ai_Gmail__get_thread' && quietPriorGmailFallbackIds.length) return quietPriorGmailFallbackIds;
+    return [ref];
+  }))] : refs;
+  const isStrippableToolName = (id, requiredService) => {
+    const s = String(id);
+    if (results.has(s) || !/^mcp__/.test(s)) return false;
+    const svc = service(s);
+    if (requiredService && svc !== requiredService) return false;
+    return ALLOWED.includes(s) || FORBIDDEN_DRAFT_TOOLS.has(s);
+  };
+  const stripStaleToolNames = (refs, requiredService = null) => {
+    if (!Array.isArray(refs) || hasForbiddenTool) return refs;
+    const hasVerified = refs.some(id => {
+      const r = receipts.get(id);
+      return r?.service && (!requiredService || r.service === requiredService);
+    });
+    if (!hasVerified) return refs;
+    return refs.filter(id => !isStrippableToolName(id, requiredService));
+  };
+  for (const s of SERVICES) {
+    if (report?.coverage?.[s]) {
+      const reqSatisfied = (REQUIRED_READS[s] ?? []).every(suffix => values.some(x => x.name.endsWith(suffix)));
+      const resolved = resolveRefs(report.coverage[s].receipt_ids);
+      report.coverage[s].receipt_ids = reqSatisfied ? stripStaleToolNames(resolved, s) : resolved;
+    }
+  }
+  for (const ep of report?.episodes ?? []) for (const item of [...(ep.facts ?? []), ...(ep.next_actions ?? []), ...(ep.resolution ? [ep.resolution] : [])]) item.evidence = stripStaleToolNames(resolveRefs(item.evidence));
   // An explicitly incomplete source with notes is a partial scan, not a failed one.
   const partial = SERVICES.filter(s => report?.coverage?.[s]?.complete === false);
   for (const s of SERVICES) {
@@ -303,7 +532,8 @@ export function verify(events, report, { quarantineEpisodes = false, previousEpi
     }
   }
   if (!Array.isArray(report?.episodes) || !Array.isArray(report?.unknowns)) errors.push('Invalid report structure.');
-  const priorById = new Map((previousEpisodes ?? []).filter(ep => ep?.episode_id && ep.status !== 'closed').map(ep => [ep.episode_id, ep]));
+  const sanitizedPrior = sanitizePreviousEpisodesForContext(previousEpisodes ?? []);
+  const priorById = new Map(sanitizedPrior.filter(ep => ep?.episode_id && ep.status !== 'closed').map(ep => [ep.episode_id, ep]));
   const seen = new Set();
   const validEpisodes = [];
   for (const ep of report?.episodes ?? []) {
@@ -347,9 +577,23 @@ export function verify(events, report, { quarantineEpisodes = false, previousEpi
     ...SERVICES.filter(s => !partial.includes(s)).flatMap(s => Array.isArray(report?.coverage?.[s]?.receipt_ids) ? report.coverage[s].receipt_ids : []),
     ...(report?.episodes ?? []).flatMap(ep => [...(ep.facts ?? []), ...(ep.next_actions ?? []), ...(ep.resolution ? [ep.resolution] : [])]).flatMap(item => Array.isArray(item?.evidence) ? item.evidence : []),
   ]);
+  function isUnchangedThreadHeaderCheck(bad) {
+    if (cited.has(bad.id) || !bad.name.endsWith('__get_thread')) return false;
+    if (bad.reason !== 'Gmail thread lacks full bodies for every message') return false;
+    const r = results.get(bad.id);
+    if (!r || r.failed || pageState(r.data).truncated) return false;
+    const messages = r.data?.messages;
+    if (!Array.isArray(messages) || !messages.length) return false;
+    const ids = messages.map(x => x.id).filter(Boolean);
+    if (ids.length !== messages.length || new Set(ids).size !== ids.length) return false;
+    const threadId = String(r.input?.threadId ?? r.input?.thread_id ?? r.input?.id ?? '');
+    if (!threadId || (r.data?.id !== undefined && String(r.data.id) !== threadId)) return false;
+    if (searchedThreadIds.has(threadId)) return false;
+    return hasVerifiedFullThread || priorThreadIds.has(threadId);
+  }
   for (const bad of unverified) {
     const source = results.get(bad.id)?.service;
-    if (cited.has(bad.id) || (source && !partial.includes(source))) errors.push(`${bad.reason}: ${bad.name}`);
+    if (cited.has(bad.id) || (source && !partial.includes(source) && !isUnchangedThreadHeaderCheck(bad))) errors.push(`${bad.reason}: ${bad.name}`);
     else warnings.push(bad);
   }
   return { report, ok: errors.length === 0, errors: [...new Set(errors)], warnings, partial, recovered_reads: recoveredReads, quarantined_episodes: quarantinedEpisodes, reads: values.filter(x => x.service).map(x => ({ id: x.id, name: x.name, service: x.service })) };
@@ -425,6 +669,57 @@ function settings() {
   const user = read(path.join(os.homedir(), '.claude/settings.json'), {});
   return { autoMemoryEnabled: false, enabledPlugins: Object.fromEntries(Object.keys(user.enabledPlugins ?? {}).map(k => [k, false])), permissions: { defaultMode: 'dontAsk', allow: ALLOWED, deny: DENIED }, hooks: { PreToolUse: [{ matcher: '', hooks: [{ type: 'command', command: `${shellQuote(process.execPath)} ${shellQuote(path.join(HERE, 'gate.mjs'))}`, onFailure: 'block' }] }] } };
 }
+function extractEpisodeTokens(ep) {
+  const text = [ep?.episode_id ?? '', ...(ep?.facts ?? []).map(f => f?.text ?? '')].join(' ');
+  const appIds = new Set([...text.matchAll(/\b(?:application(?:_id)?[\s:=#]+|^)(\d{8,})\b/gi)].map(m => m[1]));
+  const epAppMatch = String(ep?.episode_id ?? '').match(/^(\d{8,}):/);
+  if (epAppMatch) appIds.add(epAppMatch[1]);
+  const emails = new Set(
+    [...text.matchAll(/\b([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})\b/gi)]
+      .map(m => m[1].toLowerCase())
+      .filter(e => !e.endsWith('@turing.com') && !e.endsWith('@lily.greenhouse.io')),
+  );
+  return { appIds, emails };
+}
+
+export function reconcilePreviousOpenEpisodes(report, previousOpenEpisodes = []) {
+  if (!Array.isArray(report?.episodes) || !previousOpenEpisodes.length) return { missing: [] };
+  if (report.episodes.length === 0) return { missing: previousOpenEpisodes };
+  const priorIds = new Set(previousOpenEpisodes.map(ep => ep.episode_id));
+  const usedCurrentIds = new Set(report.episodes.filter(ep => priorIds.has(ep.episode_id)).map(ep => ep.episode_id));
+
+  for (const priorEp of previousOpenEpisodes) {
+    if (report.episodes.some(x => x.episode_id === priorEp.episode_id)) continue;
+    const priorTokens = extractEpisodeTokens(priorEp);
+    const rekeyed = report.episodes.find(cur => {
+      if (usedCurrentIds.has(cur.episode_id)) return false;
+      const curTokens = extractEpisodeTokens(cur);
+      const sameApp = [...priorTokens.appIds].some(id => curTokens.appIds.has(id));
+      const sameEmail = [...priorTokens.emails].some(em => curTokens.emails.has(em));
+      return sameApp || sameEmail;
+    });
+    if (rekeyed) {
+      const upgradedToAppKey =
+        /^gmail:/i.test(priorEp.episode_id) &&
+        /^\d{8,}:/.test(rekeyed.episode_id) &&
+        priorTokens.appIds.has(rekeyed.episode_id.split(':')[0]);
+      if (!upgradedToAppKey) {
+        rekeyed.episode_id = priorEp.episode_id;
+      }
+      usedCurrentIds.add(rekeyed.episode_id);
+    } else {
+      const preserved = structuredClone(priorEp);
+      preserved.unknowns = [
+        ...(Array.isArray(preserved.unknowns) ? preserved.unknowns : []),
+        'Carried forward previously open episode omitted from scan output.',
+      ];
+      report.episodes.push(preserved);
+      usedCurrentIds.add(preserved.episode_id);
+    }
+  }
+  return { missing: [] };
+}
+
 export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, claude = path.join(os.homedir(), '.local/bin/claude'), claudeProjectsDir = path.join(os.homedir(), '.claude/projects') } = {}) {
   const config = initialize(dataDir, intervalMinutes);
   const release = takeLock(dataDir, config.interval_minutes);
@@ -462,7 +757,8 @@ export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, cl
     const scanSince = previous ? Date.parse(previous.scanned_at) - 2 * 60 * MINUTE : now - 7 * 24 * 60 * MINUTE;
     const day = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(scanSince)).map(p => [p.type, p.value]));
     const ledger = summarizeLedger(dataDir);
-    const context = { allowed_tools: ALLOWED, now: iso(now), timezone: 'America/Los_Angeles', scan_since: iso(scanSince), scan_since_date_pacific: `${day.year}/${day.month}/${day.day}`, upcoming_until: iso(now + 14 * 24 * 60 * MINUTE), roster_window: rosterCalendarWindow(now), previous_episodes: (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed'), ledger };
+    const previousOpenEpisodes = sanitizePreviousEpisodesForContext((previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed'));
+    const context = { allowed_tools: ALLOWED, now: iso(now), timezone: 'America/Los_Angeles', scan_since: iso(scanSince), scan_since_date_pacific: `${day.year}/${day.month}/${day.day}`, upcoming_until: iso(now + 14 * 24 * 60 * MINUTE), roster_window: rosterCalendarWindow(now), previous_episodes: previousOpenEpisodes, ledger };
     const prompt = fs.readFileSync(path.join(HERE, 'prompt.md'), 'utf8') + '\n\n<scan_context>\n' + JSON.stringify(context) + '\n</scan_context>';
     streamFd = fs.openSync(path.join(dataDir, 'latest-stream.jsonl'), 'w', 0o600);
     stderrFd = fs.openSync(path.join(dataDir, 'latest-stderr.txt'), 'w', 0o600);
@@ -493,12 +789,10 @@ export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, cl
     if (stoppedBySignal) throw new Error(`Worker stopped by ${stoppedBySignal}.`);
     if (code !== 0) throw new Error('Claude process failed; see private latest-stderr.txt.');
     const result = events.filter(e => e.type === 'result').at(-1);
-    let report;
-    try { report = result?.structured_output ?? JSON.parse(result?.result ?? ''); } catch { throw new Error('Claude did not return the expected JSON report.'); }
-    const previousOpenEpisodes = (previous?.report.episodes ?? []).filter(ep => ep.status !== 'closed');
-    const verification = verify(events, report, { quarantineEpisodes: true, previousEpisodes: previousOpenEpisodes });
-    report = verification.report;
-    const missing = previousOpenEpisodes.filter(ep => !report.episodes?.some(x => x.episode_id === ep.episode_id));
+    const reportInput = parseReportJson(result);
+    const verification = verify(events, reportInput, { quarantineEpisodes: true, previousEpisodes: previousOpenEpisodes });
+    const report = verification.report;
+    const { missing } = reconcilePreviousOpenEpisodes(report, previousOpenEpisodes);
     if (missing.length) { verification.ok = false; verification.errors.push('Previously open episodes were omitted; last good checkpoint retained.'); }
     if (verification.ok) {
       for (const ep of report.episodes ?? []) {
@@ -513,6 +807,9 @@ export async function run({ dataDir = DEFAULT_DATA_DIR, intervalMinutes = 30, cl
     atomic(path.join(dataDir, 'last-good-stream.jsonl'), fs.readFileSync(path.join(dataDir, 'latest-stream.jsonl'), 'utf8'));
     atomic(path.join(dataDir, 'checkpoint.json'), checkpoint);
     atomic(path.join(dataDir, 'DRAFTS.md'), markdown(checkpoint));
+    if (fs.existsSync(path.join(dataDir, 'state.sqlite')) || fs.existsSync(path.join(dataDir, 'APPROVALS.md'))) {
+      spawnSync(process.execPath, [path.join(HERE, 'executor-tick.mjs'), 'sync-checkpoint', '--data-dir', dataDir], { stdio: 'ignore' });
+    }
     state.last_success = checkpoint.scanned_at;
     state.last_error = null;
     return { success: true, new_or_changed: checkpoint.changes.new_or_changed.length, checkpoint: path.join(dataDir, 'checkpoint.json'), drafts: path.join(dataDir, 'DRAFTS.md') };

@@ -60,7 +60,7 @@ flowchart TB
    - **Ruling 3 (Emoji-Only Slack Approvals):** A `:thumbsup:` (`+1`) or `:white_check_mark:` reaction from an authorized Hiring Manager on a **single-candidate** presentation message by Sam in `#field-engineering-hiring` (`C0C9VEPBAJC`) or HM DM is treated as a positive signal to advance; multi-candidate slate posts require an explicit thread reply naming the candidate.
    - **Ruling 4 (Autonomous 24h Scorecard Chase):** The 24-working-hour overdue scorecard Slack DM nudge (`24h_scorecard_chase`) is promoted to the **Autonomous Exception Tier** and recorded in `JOB.md`.
    - **Ruling 5 (Post-Screen Rejection Master Template):** Update master Greenhouse email template `"0 - Rejection - Post Phone Interview"` (`id: 4143188004`) once in Greenhouse (`app4.greenhouse.io/email_templates`) and pass `email_template_id: 4143188004` to `POST /v3/applications/{id}/reject` at fire time.
-   - **Ruling 6 (`JOB.md` Step 8 Candidate Confirmation API Chain):** Replace the legacy Greenhouse UI `"Send interview confirmation"` click in `JOB.md` Step 8 with the 100% API chain (`Chain A` Step 7): render confirmation template `4151798004` (`"Virtual Interview Confirmation *New*"`) with the Google Meet URL in place of the Zoom placeholder, patch the candidate onto the Google Calendar event (`sendUpdates: "all"`), send the confirmation email from `sam.vangelos@turing.com` on the active candidate Gmail thread, log the sent message onto the candidate's Greenhouse Activity Feed via `POST /v3/notes` (`note_type: "EMAIL"`), and schedule the day-before reminder.
+   - **Ruling 6 (`JOB.md` Step 8 Candidate Confirmation API Chain):** Replace the legacy Greenhouse UI `"Send interview confirmation"` click in `JOB.md` Step 8 with the 100% API chain (`Chain A` Step 8), replicating the Greenhouse web app's two-event model: create a **separate candidate-only** Google Calendar event (`create_event` with `summary: "Interview with Turing"`, `attendees: [{ email: candidate_email }]`, `googleMeetUrl` set to the interviewer event's Meet URL, `description: "Join the Google Meet meeting: {meet_url}"`, `visibility: "private"`, `sendUpdates: "all"` — candidates and interviewers **never** share a calendar event), render Greenhouse confirmation template `4075352004` (`"Default Candidate Interview Confirmation Message"`) or `4151798004` (`"Virtual Interview Confirmation *New*"`) with the Google Meet URL in place of the Zoom placeholder, send the confirmation email from `sam.vangelos@turing.com` on the active candidate Gmail thread, log the sent message onto the candidate's Greenhouse Activity Feed via `POST /v3/notes` (`note_type: "EMAIL"`), and schedule the day-before reminder.
 
 ### 1.2 Canonical Greenhouse & Slack Reference IDs (Verified Against [`req-1167-field-engineer.md`](file:///Users/sam.vangelos/Projects/recruiting-tools/recruiting-agents/docs/reference/reqs/req-1167-field-engineer.md) & [`people-and-ids.md`](file:///Users/sam.vangelos/Projects/recruiting-tools/recruiting-agents/docs/reference/people-and-ids.md))
 
@@ -215,12 +215,14 @@ sequenceDiagram
     GH-->>Exec: 201 Created { id: interview_id, status: "scheduled" } (Spawns interviewer scorecard slot!)
     Exec->>GCal: patch_event(eventId="gcal_hold_123", attendees=[interviewer_email], sendUpdates="all", description=KitLinkAndResumeNote)
 
-    Note over Exec,GH: Step 7 & 8: Interviewer Accepts -> Confirm to Candidate (Template 4151798004)
+    Note over Exec,GH: Step 7 & 8: Interviewer Accepts -> Confirm to Candidate (Separate Candidate Event + Template 4075352004/4151798004)
     GCal-->>Exec: Poll detects interviewer responseStatus == "accepted" (or /v3/interviewers accepted)
     Exec->>Exec: Expected-State Fresh-Read Gate (<=120s): verify Gmail thread + both calendars + GH stage
-    Exec->>Gmail: send_message(to=candidate_email, threadId, subject, htmlBody=RenderedTemplate_4151798004_WithMeetLink)
+    Exec->>GCal: create_event(calendarId="primary", summary="Interview with Turing", attendees=[candidate_email], googleMeetUrl=hangoutLink, visibility="private", sendUpdates="all")
+    GCal-->>Exec: { eventId: "gcal_cand_456" }
+    Exec->>Gmail: send_message(to=candidate_email, threadId, subject, htmlBody=RenderedTemplate_WithMeetLink)
     Gmail-->>Exec: { messageId: "msg_789" }
-    Exec->>GH: POST /v3/notes { candidate_id, application_id, note_type: "EMAIL", subject, email_from: ["sam.vangelos@turing.com"], email_to: [candidate_email], email_cc: [], body: RenderedTemplate_4151798004, visibility: "admin_only" }
+    Exec->>GH: POST /v3/notes { candidate_id, application_id, note_type: "EMAIL", subject, email_from: ["sam.vangelos@turing.com"], email_to: [candidate_email], email_cc: [], body: RenderedTemplate, visibility: "admin_only" }
     Exec->>Exec: Enqueue day-before reminder timer in state.sqlite (Step 8)
 ```
 

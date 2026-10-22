@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/sam.vangelos</string>
+		<key>NODE_USE_SYSTEM_CA</key>
+		<string>1</string>
+		<key>PATH</key>
+		<string>/Users/sam.vangelos/.local/bin:/Users/sam.vangelos/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.recruiting-agents.scheduling-pilot.executor-tick</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/sam.vangelos/homebrew/bin/node</string>
+		<string>/Users/sam.vangelos/.recruiting-agents/scheduling-pilot/app/worker/executor-tick.mjs</string>
+		<string>tick</string>
+		<string>--data-dir</string>
+		<string>/Users/sam.vangelos/.recruiting-agents/scheduling-pilot</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/sam.vangelos/.recruiting-agents/scheduling-pilot/executor-tick.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/sam.vangelos/.recruiting-agents/scheduling-pilot/executor-tick.stdout.log</string>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/sam.vangelos/.recruiting-agents/scheduling-pilot</string>
+</dict>
+</plist>

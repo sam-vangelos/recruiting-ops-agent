@@ -15,7 +15,7 @@ Designed for a recruiting organization operating without dedicated recruiting co
 | **Workflow 3: Slack HM Positive Signal → Stage Advance & Outreach** | [`src/workflows/wf3-hm-signal.ts`](src/workflows/wf3-hm-signal.ts) | Enforces single-consumption lock (`wf3_hm_signals`) per `(application_id, stage_id)` and Ruling 3 multi-candidate slate disambiguation; verifies reaction-removal/HM-override on $\le 120\text{s}$ fresh reads; routes dynamically to `Turing Assessment` (`12579939004`) or `Manager / Tech Screen` (`12579940004`) with double-email prevention. |
 | **Workflow 4: Deliberated Candidate Rejection** | [`src/workflows/wf4-rejection.ts`](src/workflows/wf4-rejection.ts) | Enforces stage-scoped negative scorecard evaluation, mixed-panel `CONFLICT_HOLD` state machine, Ruling 2 candidate-local deliberation timers (`[60, 180]` min clamped to `08:30–17:30` Mon–Fri candidate local time), and **Chain B** single-mutation Greenhouse rejection (`application_reject`). |
 | **Workflow 5: Cross-Job Transfers & Grooming (5A / 5B / 5C)** | [`src/workflows/wf5-grooming.ts`](src/workflows/wf5-grooming.ts) | **5A (Chain E):** Cross-requisition `transfer` (`application_job_transfer`) vs `fork` (`application_create` + `attachment_create`). **5B:** Forward-only stage-drift repair on `scheduled`/`awaiting_feedback` interviews in later stages. **5C:** Missing recruiter/coordinator assignment via `application_assignment_change`. |
-| **Workflow 6: 10-Step Interview Scheduling Lifecycle** | [`src/workflows/wf6-scheduling.ts`](src/workflows/wf6-scheduling.ts) | Full **Chain A** coordinator lifecycle: availability outreach, multi-timezone calendar intersection (`planner/`), silent calendar hold + Greenhouse `interview_create` with automatic compensation on failure, `+12h`/`+24h` working-hours interviewer RSVP chases, `+24h` day-before candidate confirmation, reschedule/cancel handling, and `+2h`/`+24h` scorecard chases. |
+| **Workflow 6: 10-Step Interview Scheduling Lifecycle** | [`src/workflows/wf6-scheduling.ts`](src/workflows/wf6-scheduling.ts) | Full **Chain A** coordinator lifecycle: availability outreach, multi-timezone calendar intersection (`planner/`), silent calendar hold + Greenhouse `interview_create` with automatic compensation on failure, `+12h`/`+24h` working-hours interviewer RSVP chases, end-to-end candidate confirmation (Greenhouse confirmation email with Google Meet + separate candidate-only `"Interview with Turing"` Calendar invite + Activity Feed `EMAIL` note), `+24h` day-before candidate reminder, reschedule/cancel handling, and `+2h`/`+24h` scorecard chases. |
 
 ---
 
@@ -50,13 +50,14 @@ flowchart TB
   end
 
   subgraph Executor["2. Deterministic Executor (src/executor/ & worker/executor-tick.mjs)"]
-    TICK["worker/executor-tick.mjs<br/>(60s Single-Writer Lease Runner)"]
-    EXEC["src/executor/index.ts<br/>(<=120s Fresh-Read Gate & Send Gate)"]
+    INGEST["src/bridge/checkpoint-ingest.ts<br/>(Idempotent Checkpoint -> SQLite Bridge)"]
+    TICK["worker/executor-tick.mjs<br/>(60s Lease Runner & Operator CLI)"]
+    EXEC["src/executor/index.ts & src/providers/<br/>(<=120s Fresh-Read Gate & Send Gate)"]
     WF["src/workflows/wf1..wf6<br/>(Chains A, B, C, D, E)"]
-    TICK --> EXEC --> WF
+    INGEST --> TICK --> EXEC --> WF
   end
 
-  subgraph Interactive["3. Interactive Execution Harness (CLAUDE.md)"]
+  subgraph Interactive["3. Interactive Execution Harness (CLAUDE.md & GEMINI.md)"]
     SENDGATE[".claude/hooks/send-gate.mjs<br/>(PreToolUse Verbatim Draft & Exception Gate)"]
     ROSTER["worker/roster.mjs & planner/"]
     SESSION["Interactive Session<br/>(Day View + 16-Hex Proposal Approval)"]
@@ -66,6 +67,7 @@ flowchart TB
   JOB --> SESSION
   Systems -->|"Read-only MCP calls"| GATE --> PILOT
   PILOT --> CHECKPOINT
+  CHECKPOINT --> INGEST
   SQLITE <--> EXEC
   LEDGER <--> EXEC
   EXEC -->|"Preview/Apply & Outbound Sends"| Systems
@@ -76,18 +78,18 @@ flowchart TB
 ### 1. Ambient Read-Only Worker ([`worker/pilot.mjs`](worker/pilot.mjs))
 Runs every 30 minutes via macOS `launchd`, sweeps Gmail, Google Calendar, Slack, and Greenhouse under a 3-layer read-only sandbox ([`worker/gate.mjs`](worker/gate.mjs)), verifies that every model claim is backed by actual paginated tool-call receipts, and writes verified proposals to `~/.recruiting-agents/scheduling-pilot/checkpoint.json` and `DRAFTS.md`.
 
-### 2. Deterministic Executor & WAL SQLite Store ([`src/executor/index.ts`](src/executor/index.ts), [`src/store/sqlite.ts`](src/store/sqlite.ts), [`worker/executor-tick.mjs`](worker/executor-tick.mjs))
-Runs every 60 seconds under a single-writer SQLite lease (`writer_lease` with dead-PID takeover), firing due working-hours/deliberation timers and executing human-approved 16-hex `proposal_hash` chains across Workflows 1–6. Every step enforces a fail-closed $\le 120\text{s}$ pre-dispatch fresh-read gate (`verifyFreshState`), two-phase `intent` $\rightarrow$ `succeeded` journaling in both `state.sqlite` and `ledger.jsonl`, resumable `GreenhouseActionService` composite steps (`PARTIAL_APPLIED`), and in-process send-gate verification (`verifyInProcessSendGate`).
+### 2. Deterministic Executor & WAL SQLite Store ([`src/executor/index.ts`](src/executor/index.ts), [`src/store/sqlite.ts`](src/store/sqlite.ts), [`src/bridge/checkpoint-ingest.ts`](src/bridge/checkpoint-ingest.ts), [`src/providers/live-providers.ts`](src/providers/live-providers.ts), [`worker/executor-tick.mjs`](worker/executor-tick.mjs))
+Runs every 60 seconds under a single-writer SQLite lease (`writer_lease` with dead-PID takeover), idempotently ingesting verified `checkpoint.json` episodes into `state.sqlite`, firing due working-hours/deliberation timers, and executing human-approved 16-hex `proposal_hash` chains across Workflows 1–6. Every step enforces a fail-closed $\le 120\text{s}$ pre-dispatch fresh-read gate (`verifyFreshState`), two-phase `intent` $\rightarrow$ `succeeded` journaling in both `state.sqlite` and `ledger.jsonl`, resumable `GreenhouseActionService` composite steps (`PARTIAL_APPLIED`), and in-process send-gate verification (`verifyInProcessSendGate`). Also exposes an operator CLI (`list-proposals`, `approve`, `decline`, `resolve-job`, `resolve-conflict`, `status`, `tick --dry-run`).
 
-### 3. Interactive Execution Harness ([`CLAUDE.md`](CLAUDE.md), [`.claude/hooks/send-gate.mjs`](.claude/hooks/send-gate.mjs))
-Starting a Claude Code session in this repository boots directly into recruiting operations mode, protected by a fail-closed `PreToolUse` outbound send gate ([`.claude/hooks/send-gate.mjs`](.claude/hooks/send-gate.mjs)) that blocks any unapproved outbound email/Slack message unless its exact recipient, subject, and body were shown verbatim to Sam prior to his latest turn (or carry a fresh $<15\text{m}$ ledger exception token).
+### 3. Interactive Execution Harness ([`CLAUDE.md`](CLAUDE.md), [`GEMINI.md`](GEMINI.md), [`.claude/hooks/send-gate.mjs`](.claude/hooks/send-gate.mjs))
+Starting a Claude Code or Gemini / Antigravity session in this repository boots directly into recruiting operations mode, protected by a fail-closed `PreToolUse` outbound send gate ([`.claude/hooks/send-gate.mjs`](.claude/hooks/send-gate.mjs), wired via [`.claude/settings.json`](.claude/settings.json) and [`.agents/hooks.json`](.agents/hooks.json)) that blocks any unapproved outbound email/Slack message unless its exact recipient, subject, and body were shown verbatim to Sam prior to his latest turn (or carry a fresh $<15\text{m}$ ledger exception token / standard Greenhouse confirmation template `4151798004` with Google Meet).
 
 ---
 
 ## Key Engineering Highlights
 
 ### Single-Source-of-Truth Prompt Compilation ([`JOB.md`](JOB.md) → [`tools/render.mjs`](tools/render.mjs))
-Rather than maintaining separate prompt files that inevitably drift, [`JOB.md`](JOB.md) is the canonical specification for the 10 scheduling steps, scope boundaries, and approval rules. [`tools/render.mjs`](tools/render.mjs) compiles `JOB.md` into both [`worker/prompt.md`](worker/prompt.md) and the operating section of [`CLAUDE.md`](CLAUDE.md). The test suite ([`worker/ledger.test.mjs`](worker/ledger.test.mjs)) enforces freshness (`node tools/render.mjs --check`) on every run.
+Rather than maintaining separate prompt files that inevitably drift, [`JOB.md`](JOB.md) is the canonical specification for the 10 scheduling steps, scope boundaries, and approval rules. [`tools/render.mjs`](tools/render.mjs) compiles `JOB.md` into [`worker/prompt.md`](worker/prompt.md) and the operating sections of [`CLAUDE.md`](CLAUDE.md) and [`GEMINI.md`](GEMINI.md). The test suite ([`worker/ledger.test.mjs`](worker/ledger.test.mjs)) enforces freshness (`node tools/render.mjs --check`) on every run.
 
 ### Three-Layer Read-Only Sandboxing ([`worker/gate.mjs`](worker/gate.mjs))
 The ambient background scanner cannot send messages, create drafts, or mutate calendars or candidate records across three independent layers:
@@ -188,17 +190,20 @@ All runtime state and candidate data live outside Git in `~/.recruiting-agents/s
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — Canonical specification for the unified 6-workflow Recruiting Operations Agent, `state.sqlite` schema, deterministic executor chains (Chains A–E), and security boundaries.
 - [`JOB.md`](JOB.md) — Canonical 10-step specification of the interview scheduling workflow, scope boundaries, and human-in-the-loop approval rules.
 - [`LEDGER.md`](LEDGER.md) — Schema and idempotency contract for the shared append-only ledger (`ledger.jsonl`).
-- [`CLAUDE.md`](CLAUDE.md) — Interactive Claude Code session harness (operating rules generated from [`JOB.md`](JOB.md)).
-- [`.claude/hooks/send-gate.mjs`](.claude/hooks/send-gate.mjs) — Fail-closed `PreToolUse` hook gating all outbound Gmail/Slack sends and Greenhouse mutations.
+- [`CLAUDE.md`](CLAUDE.md) & [`GEMINI.md`](GEMINI.md) — Interactive Claude Code and Gemini / Antigravity session harnesses (operating rules generated from [`JOB.md`](JOB.md)).
+- [`.claude/hooks/send-gate.mjs`](.claude/hooks/send-gate.mjs) — Fail-closed `PreToolUse` hook gating all outbound Gmail/Slack sends and Greenhouse mutations across both harnesses ([`.claude/settings.json`](.claude/settings.json) and [`.agents/hooks.json`](.agents/hooks.json)).
 - [`src/`](src/) — Deterministic Recruiting Operations Engine:
   - [`src/store/sqlite.ts`](src/store/sqlite.ts) — WAL-mode `SqliteCoordinatorStore` (`writer_lease`, `episodes`, `chain_steps`, 16-hex `approvals`, `timers`, `wf4_conflict_holds`, `wf3_hm_signals`).
   - [`src/executor/index.ts`](src/executor/index.ts) — `DeterministicExecutor` ($\le 120\text{s}$ `verifyFreshState` gate, `executeGreenhouseStep` composite loop, `verifyInProcessSendGate`, single-writer tick runner).
+  - [`src/bridge/checkpoint-ingest.ts`](src/bridge/checkpoint-ingest.ts) — Idempotent `checkpoint.json` $\rightarrow$ `state.sqlite` ingestion bridge (`ingestCheckpointToSqlite`).
+  - [`src/providers/live-providers.ts`](src/providers/live-providers.ts) — Live Greenhouse v3, Gmail, Google Calendar, and Slack provider adapters and `FreshReadFetcher`.
   - [`src/utils/timezone.ts`](src/utils/timezone.ts) — `RAILS_TO_IANA_TZ`, US holiday-aware `addWorkingHours`, and Ruling 2 deliberation window calculators.
   - [`src/workflows/`](src/workflows/) — Workflows 1–6 ([`wf1-intake.ts`](src/workflows/wf1-intake.ts), [`wf2-scorecard.ts`](src/workflows/wf2-scorecard.ts), [`wf3-hm-signal.ts`](src/workflows/wf3-hm-signal.ts), [`wf4-rejection.ts`](src/workflows/wf4-rejection.ts), [`wf5-grooming.ts`](src/workflows/wf5-grooming.ts), [`wf6-scheduling.ts`](src/workflows/wf6-scheduling.ts)).
-- [`test/`](test/) — End-to-end integration and adversarial regression suites ([`test/wp3-wp4.test.ts`](test/wp3-wp4.test.ts), [`test/wp5-wp6.test.ts`](test/wp5-wp6.test.ts)).
-- [`worker/`](worker/) — Ambient read-only runner ([`pilot.mjs`](worker/pilot.mjs)), 60s deterministic executor tick runner ([`executor-tick.mjs`](worker/executor-tick.mjs)), `PreToolUse` read gate ([`gate.mjs`](worker/gate.mjs)), Greenhouse + Calendar roster builder ([`roster.mjs`](worker/roster.mjs)), shared ledger module ([`ledger.mjs`](worker/ledger.mjs)), multi-model shadow evaluator ([`shadow.mjs`](worker/shadow.mjs)), and test suite (`*.test.mjs`). See [`worker/README.md`](worker/README.md).
+- [`test/`](test/) — End-to-end integration, runtime, and adversarial regression suites ([`test/wp3-wp4.test.ts`](test/wp3-wp4.test.ts), [`test/wp5-wp6.test.ts`](test/wp5-wp6.test.ts), [`test/chunk4-runtime.test.ts`](test/chunk4-runtime.test.ts)).
+- [`worker/`](worker/) — Ambient read-only runner ([`pilot.mjs`](worker/pilot.mjs)), 60s deterministic executor tick & operator CLI ([`executor-tick.mjs`](worker/executor-tick.mjs)), `PreToolUse` read gate ([`gate.mjs`](worker/gate.mjs)), Greenhouse + Calendar roster builder ([`roster.mjs`](worker/roster.mjs)), shared ledger module ([`ledger.mjs`](worker/ledger.mjs)), multi-model shadow evaluator ([`shadow.mjs`](worker/shadow.mjs)), and test suite (`*.test.mjs`). See [`worker/README.md`](worker/README.md).
 - [`planner/`](planner/) — Pure, zero-dependency TypeScript package for IANA timezone normalization, free/busy slot intersection, strict template rendering, and 7-rule pre-send message guarding. See [`planner/README.md`](planner/README.md) and [`planner/WORKFLOW.md`](planner/WORKFLOW.md).
-- [`launchd/`](launchd/) — macOS LaunchAgent plist templates for `.worker` (every 30m), `.health` (every 5m), and `.shadow-haiku` (8x/day).
+- [`tools/`](tools/) — Prompt/harness compiler ([`tools/render.mjs`](tools/render.mjs)) and frozen runtime deployment installer ([`tools/deploy-runtime.mjs`](tools/deploy-runtime.mjs)).
+- [`launchd/`](launchd/) — macOS LaunchAgent plist templates for `.worker` (every 30m), `.executor-tick` (every 60s), `.health` (every 5m), and `.shadow-haiku` (8x/day).
 - [`docs/reviews/`](docs/reviews/) — Architecture and adversarial review briefs.
 
 ---
@@ -210,14 +215,14 @@ All tests run offline against hermetic fixtures and mock CLI streams (zero live 
 1. **Verify prompt compilation freshness from [`JOB.md`](JOB.md):**
 
 ```sh
-node tools/render.mjs          # Regenerate worker/prompt.md and CLAUDE.md
+node tools/render.mjs          # Regenerate worker/prompt.md, CLAUDE.md, and GEMINI.md
 node tools/render.mjs --check  # Fail if generated files are stale
 ```
 
-2. **Run the full verification and test suite (151 tests across `worker/`, `send-gate`, `test/`, plus `planner/`):**
+2. **Run the full verification and test suite (175 tests across `worker/`, `send-gate`, `test/`, plus `planner/`):**
 
 ```sh
-node tools/render.mjs --check && node --test worker/*.test.mjs .claude/hooks/send-gate.test.mjs test/wp3-wp4.test.ts test/wp5-wp6.test.ts
+node tools/render.mjs --check && node --test worker/*.test.mjs .claude/hooks/send-gate.test.mjs test/wp3-wp4.test.ts test/wp5-wp6.test.ts test/chunk4-runtime.test.ts
 npm --prefix planner test && npm --prefix planner run typecheck
 ```
 
@@ -225,10 +230,11 @@ npm --prefix planner test && npm --prefix planner run typecheck
 
 ## Local Deployment & Cutover
 
-In production on macOS, the three `launchd` jobs (`com.recruiting-agents.scheduling-pilot.worker`, `.health`, `.shadow-haiku`) execute an isolated copy in `~/.recruiting-agents/scheduling-pilot/app/`:
+In production on macOS, the four `launchd` jobs (`com.recruiting-agents.scheduling-pilot.worker`, `.executor-tick`, `.health`, `.shadow-haiku`) execute an isolated frozen copy in `~/.recruiting-agents/scheduling-pilot/app/` (`0700` directory, `0600` files) installed via [`tools/deploy-runtime.mjs`](tools/deploy-runtime.mjs):
 
 ```sh
-cp worker/pilot.mjs worker/gate.mjs worker/shadow.mjs worker/ledger.mjs worker/roster.mjs worker/prompt.md ~/.recruiting-agents/scheduling-pilot/app/
+node tools/deploy-runtime.mjs
 launchctl kickstart gui/$(id -u)/com.recruiting-agents.scheduling-pilot.worker
 node ~/.recruiting-agents/scheduling-pilot/app/pilot.mjs status
+node ~/.recruiting-agents/scheduling-pilot/app/worker/executor-tick.mjs status
 ```

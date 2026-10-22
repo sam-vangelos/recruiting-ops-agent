@@ -17,8 +17,11 @@ export const ALLOWED = [
   'mcp__greenhouse-recruiter__search_my_candidates',
   'mcp__greenhouse-recruiter__search_my_interviews',
   'mcp__greenhouse-recruiter__search_my_attachments',
+  'mcp__greenhouse-recruiter__search_my_notes',
+  'mcp__greenhouse-recruiter__search_my_scorecards',
+  'mcp__greenhouse-recruiter__search_my_interviewers',
 ];
-const idList = raw => (Array.isArray(raw) ? raw : String(raw ?? '').split(',')).map(x => String(x ?? '').trim());
+const idList = raw => (Array.isArray(raw) ? raw : String(raw ?? '').trim().replace(/^\[|\]$/g, '').split(',')).map(x => String(x ?? '').trim().replace(/^['"]|['"]$/g, ''));
 // A non-empty list of non-empty ids; an absent, empty or blank list is no scope at all.
 const someIds = raw => raw !== undefined && raw !== null && idList(raw).length > 0 && idList(raw).every(Boolean);
 const pilotJobOnly = raw => { const ids = idList(raw); return ids.length === 1 && ids[0] === JOB_ID; };
@@ -29,15 +32,22 @@ export function permitted(name, input = {}) {
   if (name.includes('greenhouse-recruiter') && input.scope_handle !== undefined) return false;
   if (name.endsWith('__get_my_job')) return String(input.id) === JOB_ID;
   if (name.endsWith('__search_my_interviews') || name.endsWith('__search_my_applications')) {
-    const ids = Array.isArray(input.job_ids) ? input.job_ids : String(input.job_ids ?? '').split(',');
-    return ids.length === 1 && String(ids[0]) === JOB_ID;
+    return pilotJobOnly(input.job_ids);
   }
-  // Unscoped candidate or attachment searches are org-wide reads.
+  // Unscoped candidate, note, scorecard, interviewer, or attachment searches are org-wide reads.
   if (name.endsWith('__search_my_candidates')) {
     const job = input.job_ids ?? input.job_id;
-    return job !== undefined && job !== null ? pilotJobOnly(job) : someIds(input.candidate_ids);
+    return job !== undefined && job !== null ? pilotJobOnly(job) : (someIds(input.candidate_ids) || someIds(input.ids));
   }
-  if (name.endsWith('__search_my_attachments')) return someIds(input.application_ids) || someIds(input.candidate_ids);
+  if (name.endsWith('__search_my_notes') || name.endsWith('__search_my_scorecards')) {
+    const job = input.job_ids ?? input.job_id;
+    return job !== undefined && job !== null ? pilotJobOnly(job) : (someIds(input.application_ids) || someIds(input.candidate_ids) || someIds(input.ids));
+  }
+  if (name.endsWith('__search_my_interviewers')) {
+    const job = input.job_ids ?? input.job_id;
+    return job !== undefined && job !== null ? pilotJobOnly(job) : (someIds(input.application_ids) || someIds(input.interview_ids) || someIds(input.ids));
+  }
+  if (name.endsWith('__search_my_attachments')) return someIds(input.application_ids) || someIds(input.candidate_ids) || someIds(input.ids);
   return true;
 }
 

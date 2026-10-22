@@ -1,0 +1,17 @@
+{
+  "send-gate": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "call_mcp_tool|mcp_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ../.claude/hooks/send-gate.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

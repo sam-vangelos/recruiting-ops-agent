@@ -388,6 +388,109 @@ test('a subagent may not use a message exception either', t => {
   assert.equal(r.decision, 'deny');
 });
 
+test('standard Greenhouse confirmation email (template 4151798004 with Google Meet) passes and logs step8_standard_confirmation; Zoom or bespoke fails', t => {
+  const stdBody = [
+    'Hi Alex,',
+    '',
+    'Your video interview is confirmed for the date below, please confirm your receipt:',
+    '',
+    'Date/Time: Oct 22, 2026 1:00pm-1:30pm (GMT-07:00) Pacific Time (US & Canada)',
+    'Interviewers: Panel One',
+    '',
+    'Google Meet: https://meet.google.com/abc-defg-hij',
+    '',
+    'Set Up Your Interview Space',
+    'Can You Hear Me Now?',
+    'Running Late or Unable to Attend?',
+    'How Should You Prepare?',
+    'Why Turing?',
+    'Get to Know Our Product & Work',
+    '',
+    'Best,',
+    'Sam',
+  ].join('\n');
+  const pass = gate(t, replayTurn(), `${GMAIL}__send_message`, {
+    to: 'candidate.one@example.com',
+    subject: 'Turing - Interview Confirmation, Alex Candidate',
+    body: stdBody,
+  });
+  assert.equal(pass.decision, null, pass.reason);
+  assert.equal(JSON.parse(pass.log.trim()).exception, 'step8_standard_confirmation');
+
+  const zoomDeny = gate(t, replayTurn(), `${GMAIL}__send_message`, {
+    to: 'candidate.one@example.com',
+    subject: 'Turing - Interview Confirmation, Alex Candidate',
+    body: stdBody + '\nJoin via Zoom link.',
+  });
+  assert.equal(zoomDeny.decision, 'deny');
+
+  // Template 4151798004 ("Virtual Interview Confirmation *New*") also passes when rendered with Google Meet
+  const tpl4151798004Body = [
+    'Hi Alex,',
+    '',
+    'Thank you for taking the time to continue the interview process with Turing. We are excited to keep getting to know you.',
+    '',
+    'Your video interview with Panel One is confirmed for Friday, October 23 at 4:00 pm Eastern Time (30 minutes).',
+    '',
+    'The interview is on Google Meet: https://meet.google.com/abc-defg-hij. A calendar invite with the same link is on its way separately.',
+    '',
+    'Prepare your stories, wins, learnings, and, most importantly, questions in advance so you can share what makes you stand out for the position.',
+    '',
+    'Best,',
+    'Sam Vangelos',
+  ].join('\n');
+  const pass415 = gate(t, replayTurn(), `${GMAIL}__reply`, {
+    messageId: 'm-1',
+    body: tpl4151798004Body,
+  });
+  assert.equal(pass415.decision, null, pass415.reason);
+
+  // step8_standard_confirmation allows create_event (separate candidate event) but NEVER update_event (patching interviewer hold)
+  const createAllowed = gate(t, replayTurn(), `${CAL}__create_event`, { summary: 'Interview with Turing' }, { ledger: [intent('step8_standard_confirmation')] });
+  assert.equal(createAllowed.decision, null, createAllowed.reason);
+  const updateAsked = gate(t, replayTurn(), `${CAL}__update_event`, { eventId: 'hold-1' }, { ledger: [intent('step8_standard_confirmation')] });
+  assert.equal(updateAsked.decision, 'ask');
+});
+
+test('Gemini / Antigravity PreToolUse hook format (call_mcp_tool + USER_INPUT/PLANNER_RESPONSE transcript) is enforced identically', t => {
+  const dir = tmpdir(t);
+  const agyTranscript = writeTranscript(dir, [
+    { step_index: 1, source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'Draft the apology.' },
+    { step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', content: SHOWN },
+    { step_index: 3, source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'Send it.' },
+  ]);
+  const ledgerFile = writeLedger(dir, []);
+  const logFile = path.join(dir, 'send-gate.log');
+  const runAgy = payload => {
+    const res = spawnSync(process.execPath, [HOOK], {
+      input: JSON.stringify({ conversationId: 'c-1', transcriptPath: agyTranscript, ...payload }),
+      env: { ...process.env, SCHEDULING_LEDGER_PATH: ledgerFile, SCHEDULING_SEND_GATE_LOG: logFile },
+      encoding: 'utf8',
+    });
+    assert.equal(res.status, 0, res.stderr);
+    return JSON.parse(res.stdout.trim());
+  };
+
+  // Shown body passes with { decision: 'allow' }
+  const allowed = runAgy({
+    toolCall: { name: 'call_mcp_tool', args: { ServerName: 'gmail', ToolName: 'reply', Arguments: { messageId: 'm-1', body: BODY } } },
+  });
+  assert.equal(allowed.decision, 'allow');
+
+  // Unshown body is denied with { decision: 'deny', reason: ... }
+  const denied = runAgy({
+    toolCall: { name: 'call_mcp_tool', args: { ServerName: 'gmail', ToolName: 'reply', Arguments: { messageId: 'm-1', body: 'Unshown text.' } } },
+  });
+  assert.equal(denied.decision, 'deny');
+  assert.match(denied.reason, /not been shown to Sam verbatim/);
+
+  // Greenhouse apply_* returns { decision: 'ask' }
+  const ask = runAgy({
+    toolCall: { name: 'call_mcp_tool', args: { ServerName: 'greenhouse-recruiter', ToolName: 'apply_interview_create', Arguments: { application_id: 1 } } },
+  });
+  assert.equal(ask.decision, 'ask');
+});
+
 // ---------- pass-through and prefix independence ----------
 
 test('read tools produce no output', t => {

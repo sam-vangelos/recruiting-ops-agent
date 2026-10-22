@@ -61,7 +61,7 @@ export const EXCEPTIONS = {
   step6_interviewer_role: { kind: 'ask', tools: [/__apply_[a-z_]*(?:permission|role)[a-z_]*$/] },
   step7_interviewer_chase_12h: { kind: 'message', tools: [/__slack_send_message$/] },
   step7_interviewer_chase_24h: { kind: 'message', tools: [/__slack_send_message$/] },
-  step8_standard_confirmation: { kind: 'ask', tools: [/__apply_[a-z_]*(?:interview|confirmation|candidate_note)[a-z_]*$/, /__(create|update)_event$/] },
+  step8_standard_confirmation: { kind: ['ask', 'message'], tools: [/__apply_[a-z_]*(?:interview|confirmation|candidate_note)[a-z_]*$/, /__create_event$/, /__send_message$/, /__reply$/] },
   step8_confirmation_email: { kind: 'message', tools: [/__send_message$/, /__reply$/] },
   step9_urgent_cancellation: { kind: 'message' },
   step10_live_nudge: { kind: 'message' },
@@ -209,6 +209,9 @@ function blocksText(content) {
 // (e.g. image only), or null when the entry is not a human message.
 export function humanMessage(entry) {
   if (!entry || entry.isSidechain === true || entry.isMeta === true) return null;
+  if (entry.type === 'USER_INPUT' && entry.source === 'USER_EXPLICIT' && typeof entry.content === 'string') {
+    return genuineText(entry.content) !== null ? entry.content : null;
+  }
   if (entry.type === 'user') {
     if (entry.isCompactSummary === true || entry.isVisibleInTranscriptOnly === true) return null;
     if (entry.origin && entry.origin.kind !== 'human') return null;
@@ -232,6 +235,9 @@ export function humanMessage(entry) {
 }
 
 function assistantText(entry) {
+  if (entry?.type === 'PLANNER_RESPONSE' && typeof entry.content === 'string') {
+    return entry.content.trim() ? entry.content : null;
+  }
   if (entry?.type !== 'assistant' || entry.isSidechain === true) return null;
   const c = entry.message?.content;
   if (typeof c === 'string') return c;
@@ -325,7 +331,8 @@ export function findException({ kind, toolName, hash, now = Date.now() }) {
     const r = records[i];
     if (r?.kind !== 'action' || r.status !== 'intent' || typeof r.exception !== 'string') continue;
     const spec = EXCEPTIONS[r.exception];
-    if (!spec || spec.kind !== kind) continue;
+    const kinds = Array.isArray(spec?.kind) ? spec.kind : [spec?.kind];
+    if (!spec || !kinds.includes(kind)) continue;
     if (spec.tools && !spec.tools.some(p => p.test(toolName))) continue;
     const at = Date.parse(r.at);
     if (!Number.isFinite(at) || at < now - EXCEPTION_WINDOW_MS || at > now + CLOCK_SKEW_MS) continue;
@@ -356,6 +363,45 @@ function logException(toolName, record, sessionId) {
 const decision = (permissionDecision, permissionDecisionReason) => ({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision, permissionDecisionReason } });
 const SHOW_HOW = 'Print the full text in your reply as plain chat text (greeting through sign-off, plus every recipient address and the subject for an email, and every link URL), ask Sam, and send only after he answers. Tool inputs, summary boxes and thinking do not count as shown.';
 
+export function isStandardConfirmationEmail(out) {
+  if (!out || !Array.isArray(out.parts) || !out.parts.length) return false;
+  if (
+    out.subject &&
+    !/^(?:Turing\s*[-–—:]\s*(?:Virtual\s+)?Interview Confirmation\b|Interview Confirmation:\s*\S+|Re:\s*\S+)/i.test(
+      out.subject.trim(),
+    )
+  ) {
+    return false;
+  }
+  const combined = out.parts.join('\n');
+  if (/\bzoom\b/i.test(combined)) return false;
+  if (/\{\{[^}]+\}\}|\[(?:Enter|Insert)\s+[^\]]+\]/i.test(combined)) return false;
+  if (!/https:\/\/meet\.google\.com\/[a-z0-9-]+/i.test(combined)) return false;
+
+  // Greenhouse template 4075352004 ("Default Candidate Interview Confirmation Message")
+  const required4075352004 = [
+    'Your video interview is confirmed for the date below, please confirm your receipt:',
+    'Date/Time:',
+    'Interviewers:',
+    'Google Meet: https://meet.google.com/',
+    'Set Up Your Interview Space',
+    'Can You Hear Me Now?',
+    'Running Late or Unable to Attend?',
+    'How Should You Prepare?',
+    'Why Turing?',
+    'Get to Know Our Product & Work',
+  ];
+  if (required4075352004.every(phrase => combined.includes(phrase))) return true;
+
+  // Greenhouse template 4151798004 ("Virtual Interview Confirmation *New*" / candidate-confirmation.md)
+  const required4151798004 = [
+    'Thank you for taking the time to continue the interview process with Turing',
+    'is confirmed for',
+    'Prepare your stories, wins, learnings, and, most importantly, questions in advance',
+  ];
+  return required4151798004.every(phrase => combined.includes(phrase));
+}
+
 function gateMessage(row, input) {
   const toolName = input.tool_name;
   const args = input.tool_input ?? {};
@@ -368,6 +414,10 @@ function gateMessage(row, input) {
   const exc = findException({ kind: 'message', toolName, hash: draftHash(out.parts) });
   if (exc.record) {
     logException(toolName, exc.record, input.session_id);
+    return null;
+  }
+  if (row.channel === 'gmail' && isStandardConfirmationEmail(out)) {
+    logException(toolName, { exception: 'step8_standard_confirmation', action_key: null }, input.session_id);
     return null;
   }
   const excNote = exc.note ? ` (${exc.note})` : '';
@@ -418,6 +468,30 @@ export function decide(input) {
   }
 }
 
+function normalizeAgyInput(raw) {
+  if (!raw || typeof raw !== 'object' || !raw.toolCall) return { normalized: raw, isAgy: false };
+  const tc = raw.toolCall;
+  let tool_name = tc.name ?? '';
+  let tool_input = tc.args ?? {};
+  if (tc.name === 'call_mcp_tool' && tc.args && typeof tc.args === 'object') {
+    tool_name = `mcp__${tc.args.ServerName ?? 'mcp'}__${tc.args.ToolName ?? ''}`;
+    tool_input = tc.args.Arguments ?? {};
+  } else if (/^mcp_[^_]+_.+$/.test(tc.name ?? '')) {
+    const m = String(tc.name).match(/^mcp_([^_]+)_(.+)$/);
+    if (m) tool_name = `mcp__${m[1]}__${m[2]}`;
+  }
+  return {
+    isAgy: true,
+    normalized: {
+      ...raw,
+      tool_name,
+      tool_input,
+      transcript_path: raw.transcript_path ?? raw.transcriptPath,
+      session_id: raw.session_id ?? raw.conversationId,
+    },
+  };
+}
+
 function main() {
   const argv = process.argv.slice(2);
   if (argv[0] === '--hash') {
@@ -432,14 +506,24 @@ function main() {
     process.stdout.write(draftHash(out.parts) + '\n');
     return;
   }
-  let input;
+  let rawInput;
   try {
-    input = JSON.parse(fs.readFileSync(0, 'utf8'));
+    rawInput = JSON.parse(fs.readFileSync(0, 'utf8'));
   } catch (e) {
     process.stdout.write(JSON.stringify(decision('deny', `Blocked: the send gate could not parse its hook input (${e.message}).`)));
     return;
   }
-  const result = decide(input);
+  const { normalized, isAgy } = normalizeAgyInput(rawInput);
+  const result = decide(normalized);
+  if (isAgy) {
+    if (!result) {
+      process.stdout.write(JSON.stringify({ decision: 'allow' }));
+    } else {
+      const h = result.hookSpecificOutput;
+      process.stdout.write(JSON.stringify({ decision: h.permissionDecision, reason: h.permissionDecisionReason }));
+    }
+    return;
+  }
   if (result) process.stdout.write(JSON.stringify(result));
 }
 

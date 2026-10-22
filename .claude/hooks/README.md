@@ -24,7 +24,8 @@ Print the full message as ordinary chat text in the reply that asks Sam: greetin
 | --- | --- |
 | `step1_stage_move` | the recruiter server's `apply_application_stage_move` |
 | `step6_interviewer_role` | a Greenhouse `apply_*` tool whose name mentions a permission or role |
-| `step8_standard_confirmation` | a Greenhouse `apply_*` tool whose name mentions an interview or confirmation |
+| `step8_standard_confirmation` | a rendered Greenhouse standard confirmation email (templates `4075352004` or `4151798004` with Google Meet, which also pass automatically without a ledger intent), calendar `create_event` (creating the separate candidate-only event — never `update_event`), and Greenhouse `apply_*` tools (`interview`, `confirmation`, `candidate_note`) |
+| `step8_confirmation_email` | Gmail `send_message` / `reply` for a standard confirmation when `draft_sha256` matches |
 | `step9_urgent_cancellation` | any message tool, when `draft_sha256` matches the body |
 | `step10_live_nudge` | any message tool, when `draft_sha256` matches the body |
 

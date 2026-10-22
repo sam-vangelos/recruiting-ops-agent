@@ -1099,51 +1099,101 @@ export async function executeStep8ConfirmationChain(
   const chainId = `wf6_step8_confirm:${params.application_id}:${params.interview_id}`;
 
   const steps: ChainStepDefinition[] = [
-    // Step 8.1: Patch Google Calendar event to invite the candidate (sendUpdates: "all")
+    // Step 8.1: Create a SEPARATE candidate-only Google Calendar event sharing the Meet link (NEVER add the candidate to the interviewer hold event!)
     {
       step_index: 1,
-      step_key: 'patch_calendar_invite_candidate',
-      action_key: `patch_event_candidate:${params.interview_id}`,
+      step_key: 'create_candidate_calendar_invite',
+      action_key: `create_candidate_event:${params.interview_id}`,
       service: 'calendar',
-      operation: 'patch_event',
+      operation: 'create_candidate_event',
       exception: params.approval ? null : 'step8_standard_confirmation',
       buildInput: () => ({
-        event_id: params.hold_event_id,
-        attendees: [
-          { email: params.interviewer_email, responseStatus: 'accepted' },
-          { email: params.candidate_email, responseStatus: 'needsAction' },
-        ],
+        summary: 'Interview with Turing',
+        description: `Join the Google Meet meeting: ${params.meet_link}`,
+        start: params.starts_at,
+        end: params.ends_at,
+        attendees: [{ email: params.candidate_email, responseStatus: 'needsAction' }],
+        googleMeetUrl: params.meet_link,
+        visibility: 'private',
         sendUpdates: 'all',
       }),
       reconcile: async (_ctx, stepRow) => {
-        const evId = String((stepRow.input as Record<string, unknown>)?.event_id ?? '');
-        if (evId && calendar.getEvent) {
-          const ev = await calendar.getEvent(evId);
-          const hasCandidate = ev?.attendees?.some(
-            a => a.email.toLowerCase() === params.candidate_email.toLowerCase(),
-          );
-          if (hasCandidate) {
+        if (stepRow.provider_id && calendar.getEvent) {
+          const ev = await calendar.getEvent(stepRow.provider_id);
+          if (ev && ev.status !== 'cancelled' && ev.event_id !== params.hold_event_id) {
             return {
               reconciled: true,
-              provider_id: evId,
-              output: { event_id: evId },
+              provider_id: ev.event_id,
+              output: { candidate_event_id: ev.event_id },
             };
           }
-          if (ev) {
-            return { reconciled: false, allowSafeRetry: true };
+        }
+        if (calendar.listEvents) {
+          const listed = await calendar.listEvents({
+            start: params.starts_at,
+            end: params.ends_at,
+          });
+          const found = listed.find(
+            ev =>
+              ev.status !== 'cancelled' &&
+              ev.event_id !== params.hold_event_id &&
+              ev.summary === 'Interview with Turing' &&
+              ev.attendees?.some(
+                a => a.email.toLowerCase() === params.candidate_email.toLowerCase(),
+              ),
+          );
+          if (found) {
+            return {
+              reconciled: true,
+              provider_id: found.event_id,
+              output: { candidate_event_id: found.event_id },
+            };
           }
+          return { reconciled: false, allowSafeRetry: true };
         }
         return { reconciled: false };
       },
       execute: async (_ctx, input) => {
+        const attendees = input.attendees as Array<{ email: string; responseStatus?: string }>;
+        if (
+          attendees.some(
+            a => a.email.toLowerCase() === params.interviewer_email.toLowerCase(),
+          )
+        ) {
+          throw new Error(
+            'Invariant violation: candidate calendar event must never include the interviewer.',
+          );
+        }
+        if (calendar.createCandidateEvent) {
+          const created = await calendar.createCandidateEvent({
+            summary: String(input.summary),
+            description: String(input.description),
+            start: String(input.start),
+            end: String(input.end),
+            attendees,
+            googleMeetUrl: String(input.googleMeetUrl),
+            visibility: 'private',
+            sendUpdates: 'all',
+          });
+          return {
+            provider_id: created.event_id,
+            output: { candidate_event_id: created.event_id },
+          };
+        }
+        const hold = await calendar.createSilentHold({
+          summary: String(input.summary),
+          description: String(input.description),
+          start: String(input.start),
+          end: String(input.end),
+        });
         const patched = await calendar.patchEvent({
-          event_id: String(input.event_id),
-          attendees: input.attendees as Array<{ email: string; responseStatus?: string }>,
+          event_id: hold.event_id,
+          attendees,
           sendUpdates: 'all',
         });
         return {
           provider_id: patched.event_id,
-          output: { event_id: patched.event_id },
+          output: { candidate_event_id: patched.event_id },
         };
       },
     },
@@ -1230,6 +1280,11 @@ export async function executeStep8ConfirmationChain(
 
   if (result.ok) {
     const existingEp = executor.store.getEpisode(params.episode_id);
+    const candidateEventId =
+      (result.step_results.create_candidate_calendar_invite?.output as Record<string, unknown> | null)
+        ?.candidate_event_id ??
+      result.step_results.create_candidate_calendar_invite?.provider_id ??
+      null;
     executor.store.upsertEpisode({
       episode_id: params.episode_id,
       workflow: 'wf6_scheduling',
@@ -1242,6 +1297,7 @@ export async function executeStep8ConfirmationChain(
         ...(existingEp?.state ?? {}),
         interview_id: params.interview_id,
         hold_event_id: params.hold_event_id,
+        candidate_event_id: candidateEventId,
         meet_link: params.meet_link,
         starts_at: params.starts_at,
         ends_at: params.ends_at,
@@ -1301,6 +1357,7 @@ export async function executeStep9RescheduleChain(
     stage_id: number;
     interview_id: number;
     hold_event_id: string;
+    candidate_event_id?: string | null;
     interviewer_user_id: number;
     interviewer_email: string;
     interviewer_slack_id: string;
@@ -1320,6 +1377,12 @@ export async function executeStep9RescheduleChain(
   const calendar = executor.calendar;
   const nextAttempt = (params.previous_attempt ?? 1) + 1;
   const chainId = `wf6_step9_reschedule:${params.interview_id}:attempt_${nextAttempt}`;
+  const existingEpisode = executor.store.getEpisode(params.episode_id);
+  const candidateEventId =
+    params.candidate_event_id ??
+    (typeof existingEpisode?.state?.candidate_event_id === 'string'
+      ? existingEpisode.state.candidate_event_id
+      : null);
 
   const steps: ChainStepDefinition[] = [
     // Step 9.1: Update Greenhouse interview via interview_update (PATCH /v3/interviews/{id})
@@ -1343,7 +1406,7 @@ export async function executeStep9RescheduleChain(
       }),
     },
 
-    // Step 9.2: Patch Google Calendar event to new time (sendUpdates: "all")
+    // Step 9.2: Patch interviewer Google Calendar event to new time (sendUpdates: "all")
     {
       step_index: 2,
       step_key: 'patch_calendar_reschedule',
@@ -1396,6 +1459,59 @@ export async function executeStep9RescheduleChain(
     },
   ];
 
+  if (candidateEventId && candidateEventId !== params.hold_event_id) {
+    steps.push({
+      step_index: 3,
+      step_key: 'patch_candidate_calendar_reschedule',
+      action_key: `patch_candidate_event_reschedule:${params.interview_id}:${params.new_starts_at}`,
+      service: 'calendar',
+      operation: 'patch_event',
+      buildInput: () => ({
+        event_id: candidateEventId,
+        start: params.new_starts_at,
+        end: params.new_ends_at,
+        sendUpdates: 'all',
+      }),
+      reconcile: async (_ctx, stepRow) => {
+        const evId = String((stepRow.input as Record<string, unknown>)?.event_id ?? '');
+        if (evId && calendar.getEvent) {
+          const ev = await calendar.getEvent(evId);
+          if (ev && ev.start === params.new_starts_at && ev.end === params.new_ends_at) {
+            return {
+              reconciled: true,
+              provider_id: evId,
+              output: {
+                event_id: evId,
+                start: params.new_starts_at,
+                end: params.new_ends_at,
+              },
+            };
+          }
+          if (ev) {
+            return { reconciled: false, allowSafeRetry: true };
+          }
+        }
+        return { reconciled: false };
+      },
+      execute: async (_ctx, input) => {
+        const patched = await calendar.patchEvent({
+          event_id: String(input.event_id),
+          start: String(input.start),
+          end: String(input.end),
+          sendUpdates: 'all',
+        });
+        return {
+          provider_id: patched.event_id,
+          output: {
+            event_id: patched.event_id,
+            start: params.new_starts_at,
+            end: params.new_ends_at,
+          },
+        };
+      },
+    });
+  }
+
   const result = await executor.executeChain({
     chain_id: chainId,
     episode_id: params.episode_id,
@@ -1405,7 +1521,9 @@ export async function executeStep9RescheduleChain(
       application_id: params.application_id,
       application_status: 'active',
       stage_id: params.stage_id,
-      ignore_calendar_event_ids: [params.hold_event_id],
+      ignore_calendar_event_ids: candidateEventId
+        ? [params.hold_event_id, candidateEventId]
+        : [params.hold_event_id],
     },
     fresh_snapshot: params.fresh_snapshot,
     steps,
@@ -1470,6 +1588,7 @@ export async function executeStep9CancellationChain(
     stage_id: number;
     interview_id: number;
     hold_event_id: string;
+    candidate_event_id?: string | null;
     candidate_name: string;
     candidate_email: string;
     interview_name: string;
@@ -1486,6 +1605,12 @@ export async function executeStep9CancellationChain(
   const chainId = `wf6_step9_cancel:${params.interview_id}`;
   const exception = params.urgent_interviewer_cancel ? 'urgent_cancel_rebook' : null;
   const urgentHtmlBody = `<p>Hi ${params.candidate_name},</p><p>Our interviewer had an urgent conflict come up for your ${params.interview_name}. Could you share a few updated times that work for you to reschedule?</p><p>Best,<br/>Sam Vangelos</p>`;
+  const existingEpisode = executor.store.getEpisode(params.episode_id);
+  const candidateEventId =
+    params.candidate_event_id ??
+    (typeof existingEpisode?.state?.candidate_event_id === 'string'
+      ? existingEpisode.state.candidate_event_id
+      : null);
 
   const steps: ChainStepDefinition[] = [
     // Step 9.1: Delete Greenhouse interview via interview_delete (DELETE /v3/interviews/{id})
@@ -1501,7 +1626,7 @@ export async function executeStep9CancellationChain(
       }),
     },
 
-    // Step 9.2: Cancel/Delete Google Calendar event
+    // Step 9.2: Cancel/Delete interviewer Google Calendar event
     {
       step_index: 2,
       step_key: 'delete_calendar_event',
@@ -1541,9 +1666,49 @@ export async function executeStep9CancellationChain(
     },
   ];
 
+  if (candidateEventId && candidateEventId !== params.hold_event_id) {
+    steps.push({
+      step_index: steps.length + 1,
+      step_key: 'delete_candidate_calendar_event',
+      action_key: `delete_candidate_event:${candidateEventId}`,
+      service: 'calendar',
+      operation: 'delete_event',
+      exception,
+      buildInput: () => ({
+        event_id: candidateEventId,
+        sendUpdates: 'all',
+      }),
+      reconcile: async (_ctx, stepRow) => {
+        const evId = String((stepRow.input as Record<string, unknown>)?.event_id ?? '');
+        if (evId && calendar.getEvent) {
+          const ev = await calendar.getEvent(evId);
+          if (!ev || ev.status === 'cancelled') {
+            return {
+              reconciled: true,
+              provider_id: evId,
+              output: { deleted: true },
+            };
+          }
+          return { reconciled: false, allowSafeRetry: true };
+        }
+        return { reconciled: false };
+      },
+      execute: async (_ctx, input) => {
+        await calendar.deleteEvent({
+          event_id: String(input.event_id),
+          sendUpdates: 'all',
+        });
+        return {
+          provider_id: String(input.event_id),
+          output: { deleted: true },
+        };
+      },
+    });
+  }
+
   if (params.urgent_interviewer_cancel && gmail) {
     steps.push({
-      step_index: 3,
+      step_index: steps.length + 1,
       step_key: 'send_urgent_cancel_candidate_email',
       action_key: `urgent_cancel_notify:${params.interview_id}`,
       service: 'gmail',

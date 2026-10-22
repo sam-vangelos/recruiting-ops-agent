@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -148,6 +150,17 @@ export interface CalendarProvider {
     timeZone?: string;
     conferenceRequestId?: string;
   }): Promise<CalendarHoldEvent>;
+  createCandidateEvent?(input: {
+    summary: string;
+    description: string;
+    start: string;
+    end: string;
+    timeZone?: string;
+    attendees: Array<{ email: string; responseStatus?: string }>;
+    googleMeetUrl: string;
+    visibility?: 'private' | 'default';
+    sendUpdates: 'all' | 'none';
+  }): Promise<CalendarHoldEvent>;
   patchEvent(input: {
     event_id: string;
     summary?: string;
@@ -227,12 +240,19 @@ export interface FreshReadSnapshot {
   } | null;
   slack?: {
     has_hm_override?: boolean;
+    hm_override_detected?: boolean;
     override_ruling?: 'Advance' | 'Reject' | 'Hold' | null;
     reaction_removed?: boolean;
     interviewer_declined_reason?: string | null;
   } | null;
   calendar?: {
     conflicting_event_ids?: string[];
+    busy_intervals?: Array<{
+      start: string;
+      end: string;
+      event_id?: string;
+      summary?: string;
+    }>;
   } | null;
 }
 
@@ -241,6 +261,7 @@ export interface ExpectedFreshState {
   application_status?: 'active' | 'in_process' | string[];
   stage_id?: number;
   negative_scorecard_id?: number;
+  gmail_thread_id?: string;
   gmail_last_message_id?: string;
   require_no_unsent_sam_draft?: boolean;
   require_no_hm_override?: boolean;
@@ -252,6 +273,22 @@ export interface ExpectedFreshState {
     interview_id: number | string;
     interviewer_user_id: number;
   };
+  calendar_Check?:
+    | boolean
+    | {
+        start: string;
+        end: string;
+        calendar_id?: string;
+      };
+  calendar_check?:
+    | boolean
+    | {
+        start: string;
+        end: string;
+        calendar_id?: string;
+      };
+  slack_channel_id?: string;
+  slack_message_ts?: string;
   ignore_calendar_event_ids?: string[];
 }
 
@@ -311,12 +348,20 @@ export function verifyFreshState(
     };
   }
 
-  if (expected.application_id !== undefined) {
-    if (!snapshot.application || snapshot.application.id !== expected.application_id) {
+  if (
+    expected.application_id !== undefined ||
+    expected.application_status !== undefined ||
+    expected.stage_id !== undefined
+  ) {
+    if (
+      !snapshot.application ||
+      (expected.application_id !== undefined &&
+        snapshot.application.id !== expected.application_id)
+    ) {
       return {
         ok: false,
         code: 'MISSING_APPLICATION',
-        reason: `Expected application ${expected.application_id} in fresh read, got ${snapshot.application?.id ?? 'null'}.`,
+        reason: `Expected application ${expected.application_id ?? 'record'} in fresh read, got ${snapshot.application?.id ?? 'null'}.`,
       };
     }
   }
@@ -453,7 +498,10 @@ export function verifyFreshState(
     }
   }
 
-  if (expected.require_no_unsent_sam_draft !== false && snapshot.gmail?.has_unsent_sam_draft) {
+  const gmailSnap = snapshot.gmail ?? (snapshot as any).gmail_thread;
+  const slackSnap = snapshot.slack ?? (snapshot as any).slack_signal;
+
+  if (expected.require_no_unsent_sam_draft !== false && gmailSnap?.has_unsent_sam_draft) {
     return {
       ok: false,
       code: 'UNSENT_SAM_DRAFT',
@@ -463,19 +511,19 @@ export function verifyFreshState(
 
   if (
     expected.gmail_last_message_id !== undefined &&
-    snapshot.gmail?.last_message_id &&
-    snapshot.gmail.last_message_id !== expected.gmail_last_message_id
+    (!gmailSnap?.last_message_id ||
+      gmailSnap.last_message_id !== expected.gmail_last_message_id)
   ) {
     return {
       ok: false,
       code: 'GMAIL_THREAD_ADVANCED',
-      reason: `Gmail thread last_message_id advanced from ${expected.gmail_last_message_id} to ${snapshot.gmail.last_message_id}.`,
+      reason: `Gmail thread last_message_id advanced or missing (expected ${expected.gmail_last_message_id}, got ${gmailSnap?.last_message_id ?? 'null'}).`,
     };
   }
 
   if (
     (expected.require_no_candidate_withdrawal ?? true) &&
-    (snapshot.gmail?.candidate_withdrew || snapshot.gmail?.has_newer_candidate_reply)
+    (gmailSnap?.candidate_withdrew || gmailSnap?.has_newer_candidate_reply)
   ) {
     return {
       ok: false,
@@ -484,15 +532,18 @@ export function verifyFreshState(
     };
   }
 
-  if ((expected.require_no_hm_override ?? true) && snapshot.slack?.has_hm_override) {
+  if (
+    (expected.require_no_hm_override ?? true) &&
+    (slackSnap?.has_hm_override || slackSnap?.hm_override_detected)
+  ) {
     return {
       ok: false,
       code: 'SLACK_HM_OVERRIDE',
-      reason: `Hiring Manager override detected in Slack (${snapshot.slack.override_ruling ?? 'override'}).`,
+      reason: `Hiring Manager override detected in Slack (${slackSnap.override_ruling ?? 'override'}).`,
     };
   }
 
-  if (expected.require_no_reaction_removal && snapshot.slack?.reaction_removed) {
+  if (expected.require_no_reaction_removal && slackSnap?.reaction_removed) {
     return {
       ok: false,
       code: 'SLACK_REACTION_REMOVED',
@@ -500,11 +551,12 @@ export function verifyFreshState(
     };
   }
 
+  const ignored = new Set<string>([
+    ...(expected.ignore_calendar_event_ids ?? []),
+    ...(options.activeHoldEventIds ?? []),
+  ]);
+
   if (snapshot.calendar?.conflicting_event_ids?.length) {
-    const ignored = new Set<string>([
-      ...(expected.ignore_calendar_event_ids ?? []),
-      ...(options.activeHoldEventIds ?? []),
-    ]);
     const realConflicts = snapshot.calendar.conflicting_event_ids.filter(id => !ignored.has(id));
     if (realConflicts.length > 0) {
       return {
@@ -512,6 +564,32 @@ export function verifyFreshState(
         code: 'CALENDAR_CONFLICT',
         reason: `Calendar conflict detected on event(s): ${realConflicts.join(', ')}`,
       };
+    }
+  }
+
+  if (expected.calendar_Check || expected.calendar_check) {
+    if (
+      !snapshot.calendar ||
+      (!Array.isArray(snapshot.calendar.busy_intervals) &&
+        !Array.isArray(snapshot.calendar.conflicting_event_ids))
+    ) {
+      return {
+        ok: false,
+        code: 'CALENDAR_CONFLICT',
+        reason: 'Calendar check requested but calendar busy_intervals are missing from fresh read.',
+      };
+    }
+    if (snapshot.calendar.busy_intervals?.length) {
+      const realBusy = snapshot.calendar.busy_intervals.filter(
+        b => !b.event_id || !ignored.has(b.event_id),
+      );
+      if (realBusy.length > 0) {
+        return {
+          ok: false,
+          code: 'CALENDAR_CONFLICT',
+          reason: `Calendar busy interval conflict detected (${realBusy.length} interval(s)).`,
+        };
+      }
     }
   }
 
@@ -810,10 +888,15 @@ export async function loadGreenhouseActionService(
   options: Record<string, any> = {},
 ): Promise<ActionServiceLike> {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const distPath = path.resolve(
-    here,
-    '../../../greenhouse-mcp/packages/action-mcp/dist/index.js',
-  );
+  const candidatePaths = [
+    options.distPath,
+    process.env.GREENHOUSE_ACTION_MCP_DIST,
+    path.resolve(here, '../../../greenhouse-mcp/packages/action-mcp/dist/index.js'),
+    path.join(os.homedir(), 'Projects/recruiting-tools/greenhouse-mcp/packages/action-mcp/dist/index.js'),
+  ].filter((p): p is string => typeof p === 'string' && p.length > 0);
+  const distPath =
+    candidatePaths.find(p => fs.existsSync(p)) ??
+    path.resolve(here, '../../../greenhouse-mcp/packages/action-mcp/dist/index.js');
   const mod = await import(distPath);
   if (options.greenhouse && options.store && options.session && options.signingSecret) {
     const ServiceClass = mod.GreenhouseActionService;
@@ -985,7 +1068,7 @@ export class DeterministicExecutor {
       });
 
       if (!verification.ok) {
-        if (resolvedApproval) {
+        if (resolvedApproval && verification.code !== 'STALE_SNAPSHOT') {
           this.store.markApprovalOutcome(resolvedApproval.proposal_hash, 'stale_aborted', {
             failureReason: `${verification.code}: ${verification.reason}`,
             now: this.nowIso(),

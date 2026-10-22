@@ -479,3 +479,273 @@ export async function fireWorkflow4DeliberatedRejection(
     chain_result: chainResult,
   };
 }
+
+/**
+ * Resolves a Workflow 4 mixed-panel scorecard `CONFLICT_HOLD` for `(application_id, stage_id)`
+ * with Sam's ruling (`Advance` | `Reject` | `Hold`).
+ */
+export function resolveWorkflow4ConflictHold(
+  store: SqliteCoordinatorStore,
+  input: {
+    application_id: number;
+    stage_id: number;
+    ruling: 'Advance' | 'Reject' | 'Hold' | 'advance' | 'reject' | 'hold';
+    hold_key?: string;
+    candidate_tz?: string | null;
+    now?: string;
+  },
+): {
+  resolved: boolean;
+  ruling: 'Advance' | 'Reject' | 'Hold';
+  holds: ConflictHoldRow[];
+  episodes_updated: string[];
+  proposal?: ApprovalRow | null;
+  timer?: TimerRow | null;
+} {
+  const appId = Number(input.application_id);
+  const stageId = Number(input.stage_id);
+  if (!Number.isFinite(appId) || appId <= 0) {
+    throw new Error(`Invalid application_id for resolveWorkflow4ConflictHold: ${input.application_id}`);
+  }
+  if (!Number.isFinite(stageId) || stageId <= 0) {
+    throw new Error(`Invalid stage_id for resolveWorkflow4ConflictHold: ${input.stage_id}`);
+  }
+
+  const rawRuling = String(input.ruling ?? '').trim().toLowerCase();
+  let normalizedRuling: 'Advance' | 'Reject' | 'Hold';
+  if (rawRuling === 'advance') {
+    normalizedRuling = 'Advance';
+  } else if (rawRuling === 'reject') {
+    normalizedRuling = 'Reject';
+  } else if (rawRuling === 'hold') {
+    normalizedRuling = 'Hold';
+  } else {
+    throw new Error(
+      `Invalid ruling ${JSON.stringify(input.ruling)}; expected 'advance', 'reject', or 'hold'.`,
+    );
+  }
+
+  const now = input.now ?? new Date().toISOString();
+  let targetHolds: ConflictHoldRow[] = [];
+
+  if (input.hold_key) {
+    const found = store.getConflictHold(input.hold_key);
+    if (found) targetHolds.push(found);
+  } else {
+    targetHolds = store.listConflictHolds({
+      application_id: appId,
+      stage_id: stageId,
+    });
+  }
+
+  const matchingEpisodes = store
+    .listEpisodes({ application_id: appId })
+    .filter(
+      ep =>
+        (ep.stage_id === stageId || ep.stage_id === null) &&
+        (ep.workflow === 'wf4_rejection' || ep.status === 'CONFLICT_HOLD'),
+    );
+
+  if (targetHolds.length === 0) {
+    // Ensure a conflict hold record exists if an episode was in CONFLICT_HOLD or operator invoked CLI directly
+    const epDetails = (matchingEpisodes[0]?.state ?? {}) as Record<string, any>;
+    const scorecardIds = Array.isArray(epDetails.scorecard_ids)
+      ? epDetails.scorecard_ids.map(Number)
+      : [];
+    const created = store.upsertConflictHold({
+      application_id: appId,
+      stage_id: stageId,
+      scorecard_ids: scorecardIds,
+      details: epDetails,
+      now,
+    });
+    targetHolds = [created];
+  }
+
+  const resolvedHolds: ConflictHoldRow[] = [];
+  for (const h of targetHolds) {
+    const updated = store.resolveConflictHold(h.hold_key, normalizedRuling, now);
+    if (updated) resolvedHolds.push(updated);
+  }
+
+  const episodesUpdated: string[] = [];
+  let scheduledProposal: ApprovalRow | null = null;
+  let scheduledTimer: TimerRow | null = null;
+
+  if (normalizedRuling === 'Advance') {
+    store.cancelTimersByPrefix(
+      `wf4_reject:${appId}:${stageId}:`,
+      'conflict_hold_resolved_advance',
+      now,
+    );
+    for (const ep of matchingEpisodes) {
+      store.supersedeApprovalsForEpisode(ep.episode_id, 'conflict_hold_resolved_advance', { now });
+      store.upsertEpisode({
+        episode_id: ep.episode_id,
+        workflow: ep.workflow,
+        application_id: appId,
+        candidate_id: ep.candidate_id,
+        job_id: ep.job_id,
+        stage_id: stageId,
+        status: 'RESOLVED_ADVANCE',
+        state: {
+          ...(ep.state as Record<string, unknown>),
+          conflict_ruling: 'Advance',
+          resolved_at: now,
+        },
+        now,
+      });
+      episodesUpdated.push(ep.episode_id);
+    }
+  } else if (normalizedRuling === 'Hold') {
+    for (const ep of matchingEpisodes) {
+      store.upsertEpisode({
+        episode_id: ep.episode_id,
+        workflow: ep.workflow,
+        application_id: appId,
+        candidate_id: ep.candidate_id,
+        job_id: ep.job_id,
+        stage_id: stageId,
+        status: 'CONFLICT_HOLD',
+        state: {
+          ...(ep.state as Record<string, unknown>),
+          conflict_ruling: 'Hold',
+          updated_at: now,
+        },
+        now,
+      });
+      episodesUpdated.push(ep.episode_id);
+    }
+  } else if (normalizedRuling === 'Reject') {
+    const primaryHold = resolvedHolds[0];
+    const details = (primaryHold?.details ?? {}) as Record<string, any>;
+    const negIds = Array.isArray(details.negative_scorecard_ids)
+      ? details.negative_scorecard_ids.map(Number).filter(Number.isFinite)
+      : [];
+    const primaryNegId =
+      negIds.length > 0 ? [...negIds].sort((a, b) => a - b)[negIds.length - 1] : 0;
+
+    const episodeId =
+      matchingEpisodes[0]?.episode_id ?? `wf4_ep:${appId}:${stageId}`;
+    const candidateTz = resolveTimezone(
+      input.candidate_tz ?? (matchingEpisodes[0]?.state as any)?.candidate_tz,
+      DEFAULT_TIMEZONE,
+    );
+    const delib = computeNextBusinessDayDeliberationFireAt({
+      interview_ended_at: now,
+      candidate_tz: candidateTz,
+      application_id: appId,
+    });
+
+    const timerKey = `wf4_reject:${appId}:${stageId}:${primaryNegId}`;
+    const actionKey = `reject_application:${appId}:${stageId}:${primaryNegId}`;
+    const chainId = `wf4_chain:${appId}:${stageId}:${primaryNegId}`;
+    const rejectionParams = {
+      application_id: appId,
+      rejection_reason_id: DEFAULT_REJECTION_REASON_ID,
+      notes: DEFAULT_WF4_REJECTION_NOTE,
+      rejection_email: {
+        email_template_id: MASTER_POST_INTERVIEW_REJECTION_TEMPLATE_ID,
+        email_from_user_id: SAM_GREENHOUSE_USER_ID,
+      },
+    };
+    const expectedState = {
+      application_id: appId,
+      application_status: 'in_process' as const,
+      stage_id: stageId,
+      ...(primaryNegId > 0 ? { negative_scorecard_id: primaryNegId } : {}),
+      require_no_positive_scorecard: false,
+      require_no_hm_override: true,
+      require_no_candidate_withdrawal: true,
+    };
+
+    store.upsertEpisode({
+      episode_id: episodeId,
+      workflow: 'wf4_rejection',
+      application_id: appId,
+      candidate_id: matchingEpisodes[0]?.candidate_id ?? null,
+      job_id: matchingEpisodes[0]?.job_id ?? null,
+      stage_id: stageId,
+      status: 'deliberation_holding',
+      state: {
+        ...(matchingEpisodes[0]?.state as Record<string, unknown>),
+        scorecard_id: primaryNegId,
+        conflict_ruling: 'Reject',
+        resolved_at: now,
+        fire_at: delib.fire_at,
+        candidate_tz: delib.candidate_tz,
+      },
+      now,
+    });
+    episodesUpdated.push(episodeId);
+
+    // Approve any existing pending approvals for this episode, or register & approve the rejection proposal
+    const existingApprovals = store.listApprovals({ episode_id: episodeId });
+    const pendingWf4 = existingApprovals.find(
+      a => a.workflow === 'wf4_rejection' && a.decision === 'pending',
+    );
+    if (pendingWf4) {
+      scheduledProposal = store.grantApproval({
+        proposal_hash: pendingWf4.proposal_hash,
+        decision: 'approved',
+        actor: 'sam',
+        now,
+      });
+    } else {
+      const reg = store.registerProposal({
+        episode_id: episodeId,
+        action_key: actionKey,
+        chain_id: chainId,
+        workflow: 'wf4_rejection',
+        params: rejectionParams,
+        expected_state: expectedState,
+        now,
+      });
+      scheduledProposal =
+        reg.decision === 'pending'
+          ? store.grantApproval({
+              proposal_hash: reg.proposal_hash,
+              decision: 'approved',
+              actor: 'sam',
+              now,
+            })
+          : reg;
+    }
+
+    const existingTimers = store.listTimersForEpisode(episodeId);
+    const activeTimer = existingTimers.find(
+      t => t.kind === 'wf4_deliberated_rejection' && t.status === 'pending',
+    );
+    if (activeTimer) {
+      scheduledTimer = activeTimer;
+    } else {
+      scheduledTimer = store.scheduleTimer({
+        timer_key: timerKey,
+        episode_id: episodeId,
+        kind: 'wf4_deliberated_rejection',
+        fire_at: delib.fire_at,
+        payload: {
+          application_id: appId,
+          stage_id: stageId,
+          scorecard_id: primaryNegId,
+          candidate_tz: delib.candidate_tz,
+          proposal_hash: scheduledProposal.proposal_hash,
+          chain_id: chainId,
+          action_key: actionKey,
+          rejection_params: rejectionParams,
+          deliberation_mode: 'next_business_day',
+        },
+        now,
+      });
+    }
+  }
+
+  return {
+    resolved: resolvedHolds.length > 0,
+    ruling: normalizedRuling,
+    holds: resolvedHolds,
+    episodes_updated: episodesUpdated,
+    proposal: scheduledProposal,
+    timer: scheduledTimer,
+  };
+}
